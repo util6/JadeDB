@@ -3,7 +3,10 @@ package corekv
 import (
 	"expvar"
 	"fmt"
+	"golang.org/x/sys/windows"
 	"math"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,11 +50,16 @@ var (
 
 // Open DB
 // TODO 这里是不是要上一个目录锁比较好，防止多个进程打开同一个目录?
-func Open(opt *Options) *DB {
+func Open(opt *Options) (*DB, error) {
+
 	c := utils.NewCloser()
 	db := &DB{opt: opt}
 	// 初始化vlog结构
-	db.initVLog()
+	err := db.initVLog()
+	if err != nil {
+		return nil, fmt.Errorf("初始化vlog失败: %v", err)
+	}
+
 	// 初始化LSM结构
 	db.lsm = lsm.NewLSM(&lsm.Options{
 		WorkDir:             opt.WorkDir,
@@ -81,7 +89,29 @@ func Open(opt *Options) *DB {
 	go db.doWrites(c)
 	// 启动 info 统计过程
 	go db.stats.StartStats()
-	return db
+	return db, nil
+}
+
+func lockWorkDir(dir string) error {
+	// 创建一个临时文件用于锁定
+	tempFilePath := filepath.Join(dir, "lock.tmp")
+
+	// 打开或创建临时文件
+	file, err := os.OpenFile(tempFilePath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("error creating or opening temp file: %w", err)
+	}
+	defer file.Close()
+
+	handle := windows.Handle(file.Fd())
+
+	// 锁定整个文件
+	var begin, end uint64 = 0, ^uint64(0)
+	if err := windows.LockFileEx(handle, windows.LOCKFILE_EXCLUSIVE_LOCK, 0, uint32(begin), uint32(end), nil); err != nil {
+		return fmt.Errorf("error locking file: %w", err)
+	}
+
+	return nil
 }
 
 func (db *DB) Close() error {
@@ -117,6 +147,7 @@ func (db *DB) Set(data *utils.Entry) error {
 		vp  *utils.ValuePtr
 		err error
 	)
+	//TODO:此处是为了测试，key不加时间戳可能小于8字节会报错，后续实现MVCC可以解决
 	data.Key = utils.KeyWithTs(data.Key, math.MaxUint32)
 	// 如果value不应该直接写入LSM 则先写入 vlog文件，这时必须保证vlog具有重放功能
 	// 以便于崩溃后恢复数据
@@ -139,6 +170,8 @@ func (db *DB) Get(key []byte) (*utils.Entry, error) {
 		entry *utils.Entry
 		err   error
 	)
+	//TODO:此处是为了测试，key不加时间戳可能小于8字节会报错，后续实现MVCC可以解决
+	key = utils.KeyWithTs(key, math.MaxUint32)
 	// 从LSM中查询entry，这时不确定entry是不是值指针
 	if entry, err = db.lsm.Get(key); err != nil {
 		return entry, err
@@ -154,7 +187,8 @@ func (db *DB) Get(key []byte) (*utils.Entry, error) {
 		}
 		entry.Value = utils.SafeCopy(nil, result)
 	}
-
+	//TODO:此处是为了测试，key不加时间戳可能小于8字节会报错，后续实现MVCC可以解决
+	entry.Key = utils.Copy(entry.Key)
 	if isDeletedOrExpired(entry.Meta, entry.ExpiresAt) {
 		return nil, utils.ErrKeyNotFound
 	}
@@ -245,7 +279,7 @@ func (db *DB) sendToWriteCh(entries []*utils.Entry) (*request, error) {
 	return req, nil
 }
 
-//   Check(kv.BatchSet(entries))
+// Check(kv.BatchSet(entries))
 func (db *DB) batchSet(entries []*utils.Entry) error {
 	req, err := db.sendToWriteCh(entries)
 	if err != nil {
