@@ -105,55 +105,60 @@ type UniIterator struct {
 // less: 如果为true，表示查找小于key的最大键；如果为false，表示查找大于key的最小键。
 // allowEqual: 如果为true，当查找的键正好存在于跳表中时，允许返回该键。
 // 返回最接近key的节点和一个布尔值，表示是否找到了相等的键。
-func (s *SkipList) findSpliceForLevel(key []byte) (*node, []*node, bool) {
-
+func (s *SkipList) findNear(key []byte, allowEqual bool) (*node, bool) {
+	x := s.getHead()                   // 从跳表的头节点开始。
 	level := int(s.getHeight() - 1)    // 从跳表的最高层开始查找。
 	prev := make([]*node, maxHeight+1) // 用于存储每一层小于 key 的最大节点。
 
 	for i := level; i >= 0; i-- {
-		preNode := s.getHead() // 从跳表的头节点开始。
-		preNode, _ = s.findSpliceForLevel(key, preNode, i)
-		prev[i] = preNode
+		for next := s.getNext(x, i); next != nil && CompareKeys(key, next.key(s.arena)) > 0; next = s.getNext(x, i) {
+			x = next
+		}
+		prev[i] = x
 	}
 
 	// 从最底层开始处理
-
-	next := s.getNext(prev[0], 0)
+	x = prev[0]
+	next := s.getNext(x, 0)
 	if next == nil {
-		return prev[0], prev, false
+		return prev[0], false
 	}
 
 	cmp := CompareKeys(key, next.key(s.arena))
-	if cmp == 0 {
-		return prev[0], prev, true
+	if cmp == 0 && allowEqual {
+		return next, true
 	}
 
-	return prev[0], prev, false
+	return next, false
 }
 
 // findSpliceForLevel 在指定层级上查找键 key 的前驱和后继节点偏移量。
 // 参数 key 是要查找的键，before 是当前节点在节点池中的偏移量，level 是当前操作的层级。
 // 返回值是前驱节点偏移量和后继节点偏移量。
-func (s *SkipList) findSpliceForLevel(key []byte, preNode *node, level int) (*node, bool) {
+func (s *SkipList) findSpliceForLevel(key []byte, before uint32, level int) (uint32, uint32) {
 	for {
-		// Assume before.key < key.
-		nextNode := s.getNext(preNode, level)
+		// 提前假设 before 节点的键小于 key，这是基于二分查找的思想。
+		beforeNode := s.arena.getNode(before)
+		next := beforeNode.getNextOffset(level)
+		nextNode := s.arena.getNode(next)
+		// 如果下一个节点为空，则找到了正确的前驱和后继。
 		if nextNode == nil {
-			return preNode, false
+			return before, next
 		}
+		// 获取下一个节点的键。
 		nextKey := nextNode.key(s.arena)
+		// 比较当前键和下一个节点的键。
 		cmp := CompareKeys(key, nextKey)
-		isEqual := false
-
-		if cmp > 0 {
-			preNode = nextNode // Keep moving right on this level.
-		} else {
-			if cmp == 0 {
-				isEqual = true
-			}
-			return preNode, isEqual
+		// 如果键相等，则找到了目标节点。
+		if cmp == 0 {
+			return next, next
 		}
-
+		// 如果当前键小于下一个节点的键，则找到了正确的前驱和后继。
+		if cmp < 0 {
+			return before, next
+		}
+		// 否则，继续在当前层级向右移动。
+		before = next
 	}
 }
 
@@ -161,6 +166,7 @@ func (s *SkipList) findSpliceForLevel(key []byte, preNode *node, level int) (*no
 // 如果键已存在，则更新对应的值而不增加跳表的高度。
 // 这里的设计允许覆盖，因此我们可能不需要创建新节点或增加高度。
 func (s *SkipList) Add(e *Entry) {
+	// 从条目中提取键和值信息
 	key, v := e.Key, ValueStruct{
 		Meta:      e.Meta,
 		Value:     e.Value,
@@ -168,51 +174,73 @@ func (s *SkipList) Add(e *Entry) {
 		Version:   e.Version,
 	}
 
-	foundNode, preNodes, isEqual := s.findNear(key)
-	if isEqual && foundNode != nil {
-		// 更新已有节点的值
-		vo := s.arena.putVal(v)
-		encValue := encodeValueLocation(vo, v.EncodedSize())
-		s.getNext(preNodes[0], 0).setValue(encValue)
-		return
+	// 获取当前跳表的高度
+	listHeight := s.getHeight()
+	// 初始化用于存储每一层节点偏移量的 prev 和 next 数组
+	prev := make([]uint32, maxHeight+1)
+	next := make([]uint32, maxHeight+1)
+	// 设置搜索起点为头节点的偏移量
+	prev[listHeight] = s.headOffset
+	// 从最高层开始向下搜索以找到插入点
+	for i := int(listHeight) - 1; i >= 0; i-- {
+		// 使用更高层级的信息来加速当前层级的搜索
+		prev[i], next[i] = s.findSpliceForLevel(key, prev[i+1], i)
+		if prev[i] == next[i] {
+			vo := s.arena.putVal(v)
+			encValue := encodeValueLocation(vo, v.EncodedSize())
+			prevNode := s.arena.getNode(prev[i])
+			prevNode.setValue(encValue)
+			return
+		}
 	}
 
-	// 创建新节点
+	// 我们确实需要创建一个新的节点
 	height := s.randomHeight()
-	newNode := newNode(s.arena, key, v, height)
+	x := newNode(s.arena, key, v, height)
 
-	// 如果新节点的高度超过当前高度，需要增加跳表的高度
-	listHeight := s.getHeight()
+	// 尝试通过 CAS 更新 s.height
+	listHeight = s.getHeight()
 	for height > int(listHeight) {
 		if atomic.CompareAndSwapInt32(&s.height, listHeight, int32(height)) {
+			// 成功增加了跳表的高度
 			break
 		}
 		listHeight = s.getHeight()
 	}
 
-	// 插入新节点，并更新前链
+	// 总是从基础层级插入。在基础层级添加节点后，不能在上一层级创建节点，
+	// 因为它会发现基础层级的节点。
 	for i := 0; i < height; i++ {
 		for {
-			if preNodes[i] == nil {
-				preNodes[i] = s.getHead()
-				preNodes[i], isEqual = s.findSpliceForLevel(key, preNodes[i], i)
+			if s.arena.getNode(prev[i]) == nil {
+				AssertTrue(i > 1) // 在基础层级不可能发生这种情况
+				// 高度超过了旧的高度，因此我们没有计算这个层级的 prev 和 next。
+				// 对于这些层级，我们期望列表是稀疏的，所以我们可以直接从头部搜索。
+				prev[i], next[i] = s.findSpliceForLevel(key, s.headOffset, i)
+				// 有人在我们能够插入之前添加了完全相同的键。这只能发生在基础层级，但我们知道我们不在基础层级。
+				AssertTrue(prev[i] != next[i])
 			}
-			nextLocation := s.arena.getNodeOffset(s.getNext(preNodes[i], i))
-			newNode.levels[i] = nextLocation
-			if preNodes[i].casNextOffset(i, nextLocation, s.arena.getNodeOffset(newNode)) {
+
+			x.levels[i] = next[i]
+			pnode := s.arena.getNode(prev[i])
+			newNodeOffset := s.arena.getNodeOffset(x)
+			if pnode.casNextOffset(i, next[i], newNodeOffset) {
+				// 成功在 prev[i] 和 next[i] 之间插入 x。进入下一层。
 				break
 			}
-			// CAS 失败，重新获取 preNodes 和 nextLocation
-			preNodes[i], isEqual = s.findSpliceForLevel(key, preNodes[i], i)
-			if isEqual {
-				// 更新已有节点的值
+			// CAS 失败。我们需要重新计算 prev 和 next。
+			// 重做搜索时尝试使用不同的层级不太可能有帮助，
+			// 因为在 prev[i] 和 next[i] 之间插入大量节点的可能性不大。
+			prev[i], next[i] = s.findSpliceForLevel(key, prev[i], i)
+			if prev[i] == next[i] {
+				AssertTrueF(i == 0, "相等的情况仅在基础层级发生: %d", i)
 				vo := s.arena.putVal(v)
 				encValue := encodeValueLocation(vo, v.EncodedSize())
-				s.getNext(preNodes[i], i).setValue(encValue)
+				prevNode := s.arena.getNode(prev[i])
+				prevNode.setValue(encValue)
 				return
 			}
 		}
-
 	}
 }
 
@@ -250,17 +278,17 @@ func (s *SkipList) findLast() *node {
 // 它首先找到给定键的最接近的节点，如果存在，则比较节点的键。
 // 如果节点的键与给定键相同，则返回该节点的值；否则返回空的 ValueStruct。
 func (s *SkipList) Search(key []byte) ValueStruct {
+	// 使用 findNear 方法找到给定键的最接近的节点，第二个参数为 false 表示不包括等于键的节点，
+	// 第三个参数为 true 表示允许返回相等的键。
+	n, _ := s.findNear(key, false)
 
-	n, _, _ := s.findNear(key)
-	x := n.key(s.arena)
-	fmt.Println(string(x))
 	// 如果找到的节点为空，直接返回空的 ValueStruct。
 	if n == nil {
 		return ValueStruct{}
 	}
-	next := s.getNext(n, 0)
+
 	// 获取节点的键。
-	nextKey := s.arena.getKey(next.keyOffset, next.keySize)
+	nextKey := s.arena.getKey(n.keyOffset, n.keySize)
 
 	// 比较节点的键和给定键。
 	if !SameKey(key, nextKey) {
@@ -268,7 +296,7 @@ func (s *SkipList) Search(key []byte) ValueStruct {
 	}
 
 	// 获取节点的值偏移和值大小。
-	valOffset, valSize := next.getValueOffset()
+	valOffset, valSize := n.getValueOffset()
 
 	// 从数据结构中获取节点的值。
 	vs := s.arena.getVal(valOffset, valSize)
@@ -534,6 +562,10 @@ func (s *SkipListIterator) Close() error {
 	return nil
 }
 
+func (s *SkipListIterator) Seek(target []byte) {
+	s.n, _ = s.list.findNear(target, false) // find >=.
+}
+
 func (s *SkipListIterator) Key() []byte {
 	return s.list.arena.getKey(s.n.keyOffset, s.n.keySize)
 }
@@ -549,21 +581,13 @@ func (s *SkipListIterator) ValueUint64() uint64 {
 	return s.n.valueIndex
 }
 
-func (s *SkipListIterator) Seek(target []byte) {
-	x, _, _ := s.list.findNear(target)
-	s.n = x
-
-}
-
 // Prev advances to the previous position.
 func (s *SkipListIterator) Prev() {
 	AssertTrue(s.Valid())
-	x, _, _ := s.list.findNear(s.Key()) // find <. No equality allowed.
-	s.n = x
+	s.n, _ = s.list.findNear(s.Key(), true) // find <. No equality allowed.
 }
 func (s *SkipListIterator) SeekForPrev(target []byte) {
-	x, _, _ := s.list.findNear(target) // find <=.
-	s.n = x
+	s.n, _ = s.list.findNear(target, true) // find <=.
 }
 
 // SeekToFirst seeks position at the first entry in list.
