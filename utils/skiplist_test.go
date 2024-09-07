@@ -68,6 +68,7 @@ func TestSkipListBasicCRUD(t *testing.T) {
 	//Update a entry
 	entry2_new := NewEntry(entry1.Key, []byte("Val1+1"))
 	list.Add(entry2_new)
+	vs = list.Search(entry2_new.Key)
 	assert.Equal(t, entry2_new.Value, list.Search(entry2_new.Key).Value)
 }
 
@@ -135,7 +136,7 @@ func Benchmark_ConcurrentBasic(b *testing.B) {
 	l := newSkipList(100000000)
 	var wg sync.WaitGroup
 	key := func(i int) []byte {
-		return []byte(fmt.Sprintf("keykeykey%05d", i))
+		return []byte(fmt.Sprintf("corekv-key%05d", i))
 	}
 	for i := 0; i < n; i++ {
 		wg.Add(1)

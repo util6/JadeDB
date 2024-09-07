@@ -105,61 +105,55 @@ type UniIterator struct {
 // less: 如果为true，表示查找小于key的最大键；如果为false，表示查找大于key的最小键。
 // allowEqual: 如果为true，当查找的键正好存在于跳表中时，允许返回该键。
 // 返回最接近key的节点和一个布尔值，表示是否找到了相等的键。
-func (s *SkipList) findNear(key []byte, allowEqual bool) (*node, [maxHeight + 1]*node, bool) {
-	currentNode := s.getHead()      // 从跳表的头节点开始。
-	level := int(s.getHeight() - 1) // 从跳表的最高层开始查找。
-	var pre [maxHeight + 1]*node    // 用于存储每一层小于 key 的最大节点。
+func (s *SkipList) findSpliceForLevel(key []byte) (*node, []*node, bool) {
+
+	level := int(s.getHeight() - 1)    // 从跳表的最高层开始查找。
+	prev := make([]*node, maxHeight+1) // 用于存储每一层小于 key 的最大节点。
 
 	for i := level; i >= 0; i-- {
-		currentNode := s.getHead() // 从跳表的头节点开始。
-		for next := s.getNext(currentNode, i); next != nil && CompareKeys(key, next.key(s.arena)) > 0; next = s.getNext(currentNode, i) {
-			currentNode = next
-		}
-		pre[i] = currentNode
+		preNode := s.getHead() // 从跳表的头节点开始。
+		preNode, _ = s.findSpliceForLevel(key, preNode, i)
+		prev[i] = preNode
 	}
 
 	// 从最底层开始处理
-	currentNode = pre[0]
-	next := s.getNext(currentNode, 0)
+
+	next := s.getNext(prev[0], 0)
 	if next == nil {
-		return nil, pre, false
+		return prev[0], prev, false
 	}
 
 	cmp := CompareKeys(key, next.key(s.arena))
-	if cmp == 0 && allowEqual {
-		return next, pre, true
+	if cmp == 0 {
+		return prev[0], prev, true
 	}
 
-	return next, pre, false
+	return prev[0], prev, false
 }
 
 // findSpliceForLevel 在指定层级上查找键 key 的前驱和后继节点偏移量。
 // 参数 key 是要查找的键，before 是当前节点在节点池中的偏移量，level 是当前操作的层级。
 // 返回值是前驱节点偏移量和后继节点偏移量。
-func (s *SkipList) findSpliceForLevel(key []byte, before uint32, level int) (uint32, uint32) {
+func (s *SkipList) findSpliceForLevel(key []byte, preNode *node, level int) (*node, bool) {
 	for {
-		// 提前假设 before 节点的键小于 key，这是基于二分查找的思想。
-		prevNode := s.arena.getNode(before)
-		next := prevNode.getNextOffset(level)
-		nextNode := s.arena.getNode(next)
-		// 如果下一个节点为空，则找到了正确的前驱和后继。
+		// Assume before.key < key.
+		nextNode := s.getNext(preNode, level)
 		if nextNode == nil {
-			return before, next
+			return preNode, false
 		}
-		// 获取下一个节点的键。
 		nextKey := nextNode.key(s.arena)
-		// 比较当前键和下一个节点的键。
 		cmp := CompareKeys(key, nextKey)
-		// 如果键相等，则找到了目标节点。
-		if cmp == 0 {
-			return next, next
+		isEqual := false
+
+		if cmp > 0 {
+			preNode = nextNode // Keep moving right on this level.
+		} else {
+			if cmp == 0 {
+				isEqual = true
+			}
+			return preNode, isEqual
 		}
-		// 如果当前键小于下一个节点的键，则找到了正确的前驱和后继。
-		if cmp < 0 {
-			return before, next
-		}
-		// 否则，继续在当前层级向右移动。
-		before = next
+
 	}
 }
 
@@ -174,12 +168,12 @@ func (s *SkipList) Add(e *Entry) {
 		Version:   e.Version,
 	}
 
-	foundNode, preNodes, isEqual := s.findNear(key, true)
+	foundNode, preNodes, isEqual := s.findNear(key)
 	if isEqual && foundNode != nil {
 		// 更新已有节点的值
 		vo := s.arena.putVal(v)
 		encValue := encodeValueLocation(vo, v.EncodedSize())
-		foundNode.setValue(encValue)
+		s.getNext(preNodes[0], 0).setValue(encValue)
 		return
 	}
 
@@ -188,33 +182,36 @@ func (s *SkipList) Add(e *Entry) {
 	newNode := newNode(s.arena, key, v, height)
 
 	// 如果新节点的高度超过当前高度，需要增加跳表的高度
-	for height > int(s.getHeight()) {
-		if atomic.CompareAndSwapInt32(&s.height, s.getHeight(), int32(height)) {
+	listHeight := s.getHeight()
+	for height > int(listHeight) {
+		if atomic.CompareAndSwapInt32(&s.height, listHeight, int32(height)) {
 			break
 		}
+		listHeight = s.getHeight()
 	}
 
 	// 插入新节点，并更新前链
 	for i := 0; i < height; i++ {
-
-		if preNodes[i] == nil {
-			preNodes[i] = s.getHead()
+		for {
+			if preNodes[i] == nil {
+				preNodes[i] = s.getHead()
+				preNodes[i], isEqual = s.findSpliceForLevel(key, preNodes[i], i)
+			}
+			nextLocation := s.arena.getNodeOffset(s.getNext(preNodes[i], i))
+			newNode.levels[i] = nextLocation
+			if preNodes[i].casNextOffset(i, nextLocation, s.arena.getNodeOffset(newNode)) {
+				break
+			}
+			// CAS 失败，重新获取 preNodes 和 nextLocation
+			preNodes[i], isEqual = s.findSpliceForLevel(key, preNodes[i], i)
+			if isEqual {
+				// 更新已有节点的值
+				vo := s.arena.putVal(v)
+				encValue := encodeValueLocation(vo, v.EncodedSize())
+				s.getNext(preNodes[i], i).setValue(encValue)
+				return
+			}
 		}
-		nextLocation := s.arena.getNodeOffset(s.getNext(preNodes[i], i))
-		newNode.levels[i] = nextLocation
-		if preNodes[i].casNextOffset(i, nextLocation, s.arena.getNodeOffset(newNode)) {
-			break
-		}
-		// CAS 失败，重新获取 preNodes 和 nextLocation
-		preNodes[i], _, _ = s.findNear(key, true)
-		if isEqual && foundNode != nil {
-			// 更新已有节点的值
-			vo := s.arena.putVal(v)
-			encValue := encodeValueLocation(vo, v.EncodedSize())
-			foundNode.setValue(encValue)
-			return
-		}
-		return
 
 	}
 }
@@ -253,17 +250,17 @@ func (s *SkipList) findLast() *node {
 // 它首先找到给定键的最接近的节点，如果存在，则比较节点的键。
 // 如果节点的键与给定键相同，则返回该节点的值；否则返回空的 ValueStruct。
 func (s *SkipList) Search(key []byte) ValueStruct {
-	// 使用 findNear 方法找到给定键的最接近的节点，第二个参数为 false 表示不包括等于键的节点，
-	// 第三个参数为 true 表示允许返回相等的键。
-	n, _, _ := s.findNear(key, true)
 
+	n, _, _ := s.findNear(key)
+	x := n.key(s.arena)
+	fmt.Println(string(x))
 	// 如果找到的节点为空，直接返回空的 ValueStruct。
 	if n == nil {
 		return ValueStruct{}
 	}
-
+	next := s.getNext(n, 0)
 	// 获取节点的键。
-	nextKey := s.arena.getKey(n.keyOffset, n.keySize)
+	nextKey := s.arena.getKey(next.keyOffset, next.keySize)
 
 	// 比较节点的键和给定键。
 	if !SameKey(key, nextKey) {
@@ -271,7 +268,7 @@ func (s *SkipList) Search(key []byte) ValueStruct {
 	}
 
 	// 获取节点的值偏移和值大小。
-	valOffset, valSize := n.getValueOffset()
+	valOffset, valSize := next.getValueOffset()
 
 	// 从数据结构中获取节点的值。
 	vs := s.arena.getVal(valOffset, valSize)
@@ -553,16 +550,20 @@ func (s *SkipListIterator) ValueUint64() uint64 {
 }
 
 func (s *SkipListIterator) Seek(target []byte) {
-	s.n, _, _ = s.list.findNear(target, false)
+	x, _, _ := s.list.findNear(target)
+	s.n = x
+
 }
 
 // Prev advances to the previous position.
 func (s *SkipListIterator) Prev() {
 	AssertTrue(s.Valid())
-	s.n, _, _ = s.list.findNear(s.Key(), true) // find <. No equality allowed.
+	x, _, _ := s.list.findNear(s.Key()) // find <. No equality allowed.
+	s.n = x
 }
 func (s *SkipListIterator) SeekForPrev(target []byte) {
-	s.n, _, _ = s.list.findNear(target, true) // find <=.
+	x, _, _ := s.list.findNear(target) // find <=.
+	s.n = x
 }
 
 // SeekToFirst seeks position at the first entry in list.
