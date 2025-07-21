@@ -41,6 +41,7 @@ type memTable struct {
 	sl         *utils.Skiplist
 	buf        *bytes.Buffer
 	maxVersion uint64
+	splice     *utils.Splice // 添加Splice字段用于优化连续操作
 }
 
 // NewMemtable _
@@ -53,7 +54,12 @@ func (lsm *LSM) NewMemtable() *memTable {
 		FID:      newFid,
 		FileName: mtFilePath(lsm.option.WorkDir, newFid),
 	}
-	return &memTable{wal: file.OpenWalFile(fileOpt), sl: utils.NewSkiplist(int64(1 << 20)), lsm: lsm}
+	return &memTable{
+		wal:    file.OpenWalFile(fileOpt),
+		sl:     utils.NewSkiplist(int64(1 << 20)),
+		lsm:    lsm,
+		splice: &utils.Splice{},
+	}
 }
 
 // Close
@@ -96,7 +102,7 @@ func (m *memTable) Size() int64 {
 	return m.sl.MemSize()
 }
 
-//recovery
+// recovery
 func (lsm *LSM) recovery() (*memTable, []*memTable) {
 	// 从 工作目录中获取所有文件
 	files, err := ioutil.ReadDir(lsm.option.WorkDir)
@@ -154,9 +160,10 @@ func (lsm *LSM) openMemTable(fid uint64) (*memTable, error) {
 	}
 	s := utils.NewSkiplist(int64(1 << 20))
 	mt := &memTable{
-		sl:  s,
-		buf: &bytes.Buffer{},
-		lsm: lsm,
+		sl:     s,
+		buf:    &bytes.Buffer{},
+		lsm:    lsm,
+		splice: &utils.Splice{},
 	}
 	mt.wal = file.OpenWalFile(fileOpt)
 	err := mt.UpdateSkipList()

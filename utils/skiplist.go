@@ -292,10 +292,98 @@ func (s *Skiplist) getHeight() int32 {
 	return atomic.LoadInt32(&s.height)
 }
 
-// Put inserts the key-value pair.
+// Splice 用于记录搜索路径，优化连续操作
+type Splice struct {
+	prev [maxHeight]uint32
+	next [maxHeight]uint32
+}
+
+// findSplice 查找并记录搜索路径
+func (s *Skiplist) findSplice(key []byte, splice *Splice) {
+	x := s.getHead()
+	level := int(s.getHeight() - 1)
+
+	for {
+		next := s.getNext(x, level)
+		if next == nil {
+			// 记录当前层的路径
+			splice.prev[level] = s.arena.getNodeOffset(x)
+			splice.next[level] = 0
+			if level > 0 {
+				level--
+				continue
+			}
+			return
+		}
+
+		nextKey := next.key(s.arena)
+		cmp := CompareKeys(key, nextKey)
+		if cmp > 0 {
+			// 继续向右搜索
+			x = next
+			continue
+		}
+		if cmp == 0 {
+			// 找到相同key，记录路径
+			splice.prev[level] = s.arena.getNodeOffset(x)
+			splice.next[level] = s.arena.getNodeOffset(next)
+			if level > 0 {
+				level--
+				continue
+			}
+			return
+		}
+		// cmp < 0，记录当前路径并继续向下搜索
+		splice.prev[level] = s.arena.getNodeOffset(x)
+		splice.next[level] = s.arena.getNodeOffset(next)
+		if level > 0 {
+			level--
+			continue
+		}
+		return
+	}
+}
+
+// insertWithSplice 使用Splice信息插入节点
+func (s *Skiplist) insertWithSplice(key []byte, v ValueStruct, splice *Splice) {
+	height := s.randomHeight()
+	x := newNode(s.arena, key, v, height)
+
+	// 尝试增加跳表高度
+	listHeight := s.getHeight()
+	for height > int(listHeight) {
+		if atomic.CompareAndSwapInt32(&s.height, listHeight, int32(height)) {
+			break
+		}
+		listHeight = s.getHeight()
+	}
+
+	// 从底层开始插入
+	for i := 0; i < height; i++ {
+		for {
+			prev := s.arena.getNode(splice.prev[i])
+			next := s.arena.getNode(splice.next[i])
+
+			if prev == nil {
+				// 如果prev为nil，说明这是新的一层，需要重新搜索
+				splice.prev[i], splice.next[i] = s.findSpliceForLevel(key, s.headOffset, i)
+				prev = s.arena.getNode(splice.prev[i])
+				next = s.arena.getNode(splice.next[i])
+			}
+
+			x.tower[i] = splice.next[i]
+			if prev.casNextOffset(i, splice.next[i], s.arena.getNodeOffset(x)) {
+				break
+			}
+
+			// CAS失败，需要重新搜索
+			splice.prev[i], splice.next[i] = s.findSpliceForLevel(key, splice.prev[i], i)
+		}
+	}
+}
+
+// Add 修改后的Add方法，支持Splice优化
 func (s *Skiplist) Add(e *Entry) {
-	// Since we allow overwrite, we may not need to create a new node. We might not even need to
-	// increase the height. Let's defer these actions.
 	key, v := e.Key, ValueStruct{
 		Meta:      e.Meta,
 		Value:     e.Value,
@@ -303,69 +391,22 @@ func (s *Skiplist) Add(e *Entry) {
 		Version:   e.Version,
 	}
 
-	listHeight := s.getHeight()
-	var prev [maxHeight + 1]uint32
-	var next [maxHeight + 1]uint32
-	prev[listHeight] = s.headOffset
-	for i := int(listHeight) - 1; i >= 0; i-- {
-		// Use higher level to speed up for current level.
-		prev[i], next[i] = s.findSpliceForLevel(key, prev[i+1], i)
-		if prev[i] == next[i] {
-			vo := s.arena.putVal(v)
-			encValue := encodeValue(vo, v.EncodedSize())
-			prevNode := s.arena.getNode(prev[i])
-			prevNode.setValue(s.arena, encValue)
-			return
-		}
+	// 创建Splice结构
+	splice := &Splice{}
+	s.findSplice(key, splice)
+
+	// 检查是否需要更新已存在的节点
+	if splice.prev[0] == splice.next[0] && splice.prev[0] != 0 {
+		// 找到相同key的节点，更新值
+		prevNode := s.arena.getNode(splice.prev[0])
+		vo := s.arena.putVal(v)
+		encValue := encodeValue(vo, v.EncodedSize())
+		prevNode.setValue(s.arena, encValue)
+		return
 	}
 
-	// We do need to create a new node.
-	height := s.randomHeight()
-	x := newNode(s.arena, key, v, height)
-
-	// Try to increase s.height via CAS.
-	listHeight = s.getHeight()
-	for height > int(listHeight) {
-		if atomic.CompareAndSwapInt32(&s.height, listHeight, int32(height)) {
-			// Successfully increased skiplist.height.
-			break
-		}
-		listHeight = s.getHeight()
-	}
-
-	// We always insert from the base level and up. After you add a node in base level, we cannot
-	// create a node in the level above because it would have discovered the node in the base level.
-	for i := 0; i < height; i++ {
-		for {
-			if s.arena.getNode(prev[i]) == nil {
-				AssertTrue(i > 1) // This cannot happen in base level.
-				// We haven't computed prev, next for this level because height exceeds old listHeight.
-				// For these levels, we expect the lists to be sparse, so we can just search from head.
-				prev[i], next[i] = s.findSpliceForLevel(key, s.headOffset, i)
-				// Someone adds the exact same key before we are able to do so. This can only happen on
-				// the base level. But we know we are not on the base level.
-				AssertTrue(prev[i] != next[i])
-			}
-			x.tower[i] = next[i]
-			pnode := s.arena.getNode(prev[i])
-			if pnode.casNextOffset(i, next[i], s.arena.getNodeOffset(x)) {
-				// Managed to insert x between prev[i] and next[i]. Go to the next level.
-				break
-			}
-			// CAS failed. We need to recompute prev and next.
-			// It is unlikely to be helpful to try to use a different level as we redo the search,
-			// because it is unlikely that lots of nodes are inserted between prev[i] and next[i].
-			prev[i], next[i] = s.findSpliceForLevel(key, prev[i], i)
-			if prev[i] == next[i] {
-				AssertTruef(i == 0, "Equality can happen only on base level: %d", i)
-				vo := s.arena.putVal(v)
-				encValue := encodeValue(vo, v.EncodedSize())
-				prevNode := s.arena.getNode(prev[i])
-				prevNode.setValue(s.arena, encValue)
-				return
-			}
-		}
-	}
+	// 使用Splice信息插入新节点
+	s.insertWithSplice(key, v, splice)
 }
 
 // Empty returns if the Skiplist is empty.
@@ -564,6 +605,7 @@ type UniIterator struct {
 }
 
 // FastRand is a fast thread local random function.
+//
 //go:linkname FastRand runtime.fastrand
 func FastRand() uint32
 

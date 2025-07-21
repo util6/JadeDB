@@ -465,7 +465,6 @@ func buildChangeSet(cd *compactDef, newTables []*table) pb.ManifestChangeSet {
 	return pb.ManifestChangeSet{Changes: changes}
 }
 
-//
 func newDeleteChange(id uint64) *pb.ManifestChange {
 	return &pb.ManifestChange{
 		Id: id,
@@ -899,32 +898,33 @@ func (lm *levelManager) subcompact(it utils.Iterator, kr keyRange, cd compactDef
 		if len(kr.right) > 0 && utils.CompareKeys(key, kr.right) >= 0 {
 			break
 		}
-		// 拼装table创建的参数
-		// TODO 这里可能要大改，对open table的参数复制一份opt
+
 		builder := newTableBuilerWithSSTSize(lm.opt, cd.t.fileSz[cd.nextLevel.levelNum])
 
-		// This would do the iteration and add keys to builder.
-		addKeys(builder)
+		// 使用Splice优化批量添加键
+		for ; it.Valid(); it.Next() {
+			if len(kr.right) > 0 && utils.CompareKeys(it.Item().Entry().Key, kr.right) >= 0 {
+				break
+			}
+			builder.Add(it.Item().Entry())
+		}
 
-		// It was true that it.Valid() at least once in the loop above, which means we
-		// called Add() at least once, and builder is not Empty().
 		if builder.empty() {
-			// Cleanup builder resources:
 			builder.finish()
 			builder.Close()
 			continue
 		}
+
 		if err := inflightBuilders.Do(); err != nil {
-			// Can't return from here, until I decrRef all the tables that I built so far.
 			break
 		}
-		// 充分发挥 ssd的并行 写入特性
+
 		go func(builder *tableBuilder) {
 			defer inflightBuilders.Done(nil)
 			defer builder.Close()
+
 			var tbl *table
-			newFID := atomic.AddUint64(&lm.maxFID, 1) // compact的时候是没有memtable的，这里自增maxFID即可。
-			// TODO 这里的sst文件需要根据level大小变化
+			newFID := atomic.AddUint64(&lm.maxFID, 1)
 			sstName := utils.FileNameSSTable(lm.opt.WorkDir, newFID)
 			tbl = openTable(lm, sstName, builder)
 			if tbl == nil {

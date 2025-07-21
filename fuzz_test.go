@@ -42,4 +42,5 @@ func FuzzAPI(f *testing.F) {
 			t.Fatal(err)
 		}
 	})
+	
 }
