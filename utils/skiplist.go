@@ -432,7 +432,7 @@ func decodeValueLocation(value uint64) (valOffset uint32, valSize uint32) {
 
 // NewSkipList 创建并返回一个新的跳表实例。
 // arenaSize 参数指定跳表底层存储空间的大小。
-func newSkipList(arenaSize int64) *SkipList {
+func NewSkipList(arenaSize int64) *SkipList {
 	// 初始化存储空间，arenaSize为存储空间大小。
 	area := newArena(arenaSize)
 	// 创建一个新的节点，作为跳表的头节点。

@@ -16,6 +16,11 @@ package cache
 
 import "math"
 
+const (
+	//布隆过滤器中允许的最大哈希函数数量
+	BloomFilterMaxHashes = 30
+)
+
 // Filter is an encoded set of []byte keys.
 type Filter []byte
 
@@ -61,20 +66,36 @@ func (f *BloomFilter) InsertKey(k []byte) bool {
 	return f.Insert(Hash(k))
 }
 
+// Insert 将一个元素插入到布隆过滤器中。
+// 该方法返回一个布尔值，表示插入是否成功。
+// 参数:
+//
+//	h - 要插入元素的哈希值。
+//
+// 返回值:
+//
+//	插入操作的结果，目前总是返回true。
 func (f *BloomFilter) Insert(h uint32) bool {
 	k := f.k
+	// 当k大于30时，认为这是一个为短布隆过滤器可能的新编码保留的情况。
+	// 直接认为匹配成功。
 	if k > 30 {
-		// This is reserved for potentially new encodings for short Bloom filters.
-		// Consider it a match.
 		return true
 	}
+	// 计算布隆过滤器比特数组的大小（比特数）。
 	nBits := uint32(8 * (f.Len() - 1))
+	// 计算一个用于后续哈希值变化的delta值。
 	delta := h>>17 | h<<15
+	// 对于每个哈希函数，计算比特位置并设置相应的比特为1。
 	for j := uint8(0); j < k; j++ {
+		// 计算当前哈希函数对应的比特位置。
 		bitPos := h % uint32(nBits)
+		// 设置比特位置为1。
 		f.bitmap[bitPos/8] |= 1 << (bitPos % 8)
+		// 更新哈希值以使用下一个哈希函数。
 		h += delta
 	}
+	// 插入操作成功。
 	return true
 }
 
@@ -91,11 +112,9 @@ func (f *BloomFilter) AllowKey(k []byte) bool {
 
 // Allow 方法用于判断给定的元素是否已经被布隆过滤器接受。
 // 如果元素已经被接受，则返回 true；否则，将其插入过滤器并返回 false。
-// 这个方法首先检查自身是否为空，如果为空，则直接返回 true，
-// 表示任何元素都可以通过空的布隆过滤器。
+// 这个方法首先检查自身是否为空，如果为空，则直接返回 true， 表示任何元素都可以通过空的布隆过滤器。
 // 如果过滤器不为空且元素尚未被包含，则将其插入过滤器中。
-//
-//	如果元素已经被过滤器包含，则返回 true；否则返回 false。
+// 如果元素已经被过滤器包含，则返回 true；否则返回 false。
 func (f *BloomFilter) Allow(h uint32) bool {
 	// 检查布隆过滤器是否为空，如果为空，则任何元素都可以通过
 	if f == nil {
@@ -130,43 +149,69 @@ func newFilter(numEntries int, falsePositive float64) *BloomFilter {
 	return initFilter(numEntries, bitsPerKey)
 }
 
-// BloomBitsPerKey returns the bits per key required by bloomfilter based on
-// the false positive rate.
+// BloomBitsPerKey 计算布隆过滤器每个关键字所需的位数。
+// 该函数基于给定的关键字数量和期望的误报率来计算。
+// 参数:
+//
+//	numEntries - 布隆过滤器中预计要插入的关键字数量。
+//	fp - 期望的误报率，表示为浮点数（例如，0.01表示1%的误报率）。
+// 返回值:
+//	返回每个关键字推荐的位数，以整数形式表示。
+
 func bloomBitsPerKey(numEntries int, fp float64) int {
+	// 计算Bloom过滤器大小（位数）所需的哈希函数数量。
+	// 使用自然对数来估算误报率的公式。
 	size := -1 * float64(numEntries) * math.Log(fp) / math.Pow(float64(0.69314718056), 2)
+	// 计算每个键所需的位数，向上取整以确保有足够的位数。
 	locs := math.Ceil(size / float64(numEntries))
 	return int(locs)
 }
 
+// initFilter 初始化一个BloomFilter实例。
+// 参数 numEntries 表示预计添加到过滤器的元素数量。
+// 参数 bitsPerKey 用于估算过滤器中每个元素占用的位数。
+// 返回值为一个指向初始化后的BloomFilter的指针。
 func initFilter(numEntries int, bitsPerKey int) *BloomFilter {
+	// 创建一个BloomFilter实例
 	bf := &BloomFilter{}
+
+	// 确保bitsPerKey不为负值，负值在此上下文中无意义
 	if bitsPerKey < 0 {
 		bitsPerKey = 0
 	}
-	// 0.69 is approximately ln(2).
+
+	// 计算哈希函数的数量，0.69是大约ln(2)
 	k := uint32(float64(bitsPerKey) * 0.69)
+	// 确保哈希函数数量至少为1
 	if k < 1 {
 		k = 1
 	}
-	if k > 30 {
-		k = 30
+	// 将哈希函数数量限制在30以内，以避免过多哈希函数造成的效率降低
+	if k > BloomFilterMaxHashes {
+		k = BloomFilterMaxHashes
 	}
+	// 设置BloomFilter的哈希函数数量
 	bf.k = uint8(k)
 
+	// 计算BloomFilter应包含的总位数
 	nBits := numEntries * int(bitsPerKey)
-	// For small len(keys), we can see a very high false positive rate. Fix it
-	// by enforcing a minimum bloom filter length.
+	// 对于较小的元素数量，可能会看到很高的假阳性率。通过强制实行最小BloomFilter长度来修正
 	if nBits < 64 {
 		nBits = 64
 	}
+	// 计算位数对应的字节数
 	nBytes := (nBits + 7) / 8
+	// 重新调整位数到正好填充字节数
 	nBits = nBytes * 8
+	// 初始化过滤器字节数组
 	filter := make([]byte, nBytes+1)
 
-	//record the K value of this Bloom Filter
+	// 在字节数组的末尾记录BloomFilter的哈希函数数量
 	filter[nBytes] = uint8(k)
 
+	// 设置BloomFilter的位图
 	bf.bitmap = filter
+	// 返回初始化后的BloomFilter实例
 	return bf
 }
 

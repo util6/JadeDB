@@ -343,22 +343,35 @@ func (db *DB) writeRequests(reqs []*request) error {
 	done(nil)
 	return nil
 }
+
+// writeToLSM 将请求中的数据写入 LSM 树。
+// 该函数负责决定每个条目应如何处理并存储到 LSM 树中。
+
 func (db *DB) writeToLSM(b *request) error {
+	// 检查请求中的 Ptrs 和 Entries 数量是否匹配，如果不匹配则返回错误。
 	if len(b.Ptrs) != len(b.Entries) {
-		return errors.Errorf("Ptrs and Entries don't match: %+v", b)
+		return errors.Errorf("Ptrs 和 Entries 不匹配: %+v", b)
 	}
 
+	// 遍历请求中的每个条目，决定其应如何处理和存储。
 	for i, entry := range b.Entries {
-		if db.shouldWriteValueToLSM(entry) { // Will include deletion / tombstone case.
+		// 判断条目的值是否应该直接写入 LSM 树。
+		if db.shouldWriteValueToLSM(entry) {
+			// 清除条目元数据中的指针位，表示值是直接存储的。
 			entry.Meta = entry.Meta &^ utils.BitValuePointer
 		} else {
+			// 设置条目元数据中的指针位，表示值是以指针形式存储的。
 			entry.Meta = entry.Meta | utils.BitValuePointer
+			// 编码并存储指向值位置的指针。
 			entry.Value = b.Ptrs[i].Encode()
 		}
+		// 将处理后的条目存储到 LSM 树中。
 		db.lsm.Set(entry)
 	}
+	// 如果所有条目都已成功处理并存储，则返回 nil。
 	return nil
 }
+
 func (req *request) IncrRef() {
 	atomic.AddInt32(&req.ref, 1)
 }

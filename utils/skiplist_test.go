@@ -47,7 +47,7 @@ func RandString(len int) string {
 */
 
 func TestSkipListBasicCRUD(t *testing.T) {
-	list := newSkipList(1 << 10)
+	list := NewSkipList(1 << 10)
 
 	//Put & Get
 	entry1 := NewEntry([]byte(RandString(10)), []byte("Val1"))
@@ -73,7 +73,7 @@ func TestSkipListBasicCRUD(t *testing.T) {
 }
 
 func Benchmark_SkipListBasicCRUD(b *testing.B) {
-	list := newSkipList(1 << 20)
+	list := NewSkipList(1 << 20)
 	key, val := "", ""
 	maxTime := 1000
 	for i := 0; i < maxTime; i++ {
@@ -87,7 +87,7 @@ func Benchmark_SkipListBasicCRUD(b *testing.B) {
 }
 
 func TestDrawList(t *testing.T) {
-	list := newSkipList(1000)
+	list := NewSkipList(1000)
 	n := 12
 	for i := 0; i < n; i++ {
 		index := strconv.Itoa(r.Intn(90) + 10)
@@ -102,7 +102,7 @@ func TestDrawList(t *testing.T) {
 
 func TestConcurrentBasic(t *testing.T) {
 	const n = 1000
-	l := newSkipList(100000000)
+	l := NewSkipList(100000000)
 	var wg sync.WaitGroup
 	key := func(i int) []byte {
 		return []byte(fmt.Sprintf("Keykeykey%05d", i))
@@ -131,7 +131,7 @@ func TestConcurrentBasic(t *testing.T) {
 
 func Benchmark_ConcurrentBasic(b *testing.B) {
 	const n = 1000
-	l := newSkipList(100000000)
+	l := NewSkipList(100000000)
 	var wg sync.WaitGroup
 	key := func(i int) []byte {
 		return []byte(fmt.Sprintf("corekv-key%05d", i))
@@ -159,7 +159,7 @@ func Benchmark_ConcurrentBasic(b *testing.B) {
 }
 
 func TestSkipListIterator(t *testing.T) {
-	list := newSkipList(100000)
+	list := NewSkipList(100000)
 
 	//Put & Get
 	entry1 := NewEntry([]byte(RandString(10)), []byte(RandString(10)))

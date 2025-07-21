@@ -36,6 +36,8 @@ const (
 
 	// MaxNodeSize 定义了节点的最大大小，通过使用 unsafe 包来获取 node 结构体的系统级大小。
 	MaxNodeSize = int(unsafe.Sizeof(node{}))
+
+	maxCapacity = 1 << 30
 )
 
 // Arena 是一个无锁的内存管理结构，用于高效地管理和分配内存。
@@ -86,8 +88,8 @@ func (s *Arena) allocate(sz uint32) uint32 {
 		growBy := uint32(len(s.buf))
 
 		//检查扩容大小是否超过了 1GB (1<<30 字节)。
-		if growBy > 1<<30 {
-			growBy = 1 << 30
+		if growBy > maxCapacity {
+			growBy = maxCapacity
 		}
 		if growBy < sz {
 			growBy = sz
