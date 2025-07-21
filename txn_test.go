@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 
-package corekv
+package JadeDB
 
 import (
 	"fmt"
-	"github.com/hardcore-os/corekv/utils"
 	"github.com/stretchr/testify/require"
+	"github.com/util6/JadeDB/utils"
 	"io/ioutil"
 	"os"
 	"strconv"

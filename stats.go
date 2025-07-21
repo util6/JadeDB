@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package corekv
+package JadeDB
 
-import "github.com/rookieLiuyutao/corekv/utils"
+import (
+	"github.com/util6/JadeDB/utils"
+)
 
 type Stats struct {
 	closer   *utils.Closer

@@ -1,4 +1,4 @@
-//go:build darwi
+//go:build darwin
 // +build darwin
 
 /*

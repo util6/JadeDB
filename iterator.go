@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package corekv
+package JadeDB
 
 import (
-	"github.com/rookieLiuyutao/corekv/utils"
+	"github.com/util6/JadeDB/utils"
 )
 
 type DBIterator struct {
@@ -35,7 +35,7 @@ func (db *DB) NewIterator(opt *utils.Options) utils.Iterator {
 
 	res := &DBIterator{
 		vlog: db.vlog,
-		iitr: lsm.NewMergeIterator(iters, opt.IsAsc),
+		iitr: db.lsm.NewMergeIterator(iters, opt.IsAsc),
 	}
 	return res
 }

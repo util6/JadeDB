@@ -1,9 +1,9 @@
-package corekv
+package JadeDB
 
 import (
 	"bytes"
-	"github.com/hardcore-os/corekv/lsm"
-	"github.com/hardcore-os/corekv/utils"
+	"github.com/util6/JadeDB/lsm"
+	"github.com/util6/JadeDB/utils"
 	"math"
 	"sync/atomic"
 )

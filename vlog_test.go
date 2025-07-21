@@ -11,11 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-package corekv
+package JadeDB
 
 import (
 	"bytes"
-	"github.com/rookieLiuyutao/corekv-self-complete/utils"
+	"github.com/util6/JadeDB/utils"
 	"math/rand"
 	"os"
 	"testing"

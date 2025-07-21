@@ -1,10 +1,11 @@
-package corekv
+package JadeDB
 
 import (
 	"bytes"
-	"context"
+
 	"encoding/hex"
-	"github.com/hardcore-os/corekv/utils"
+	"github.com/util6/JadeDB/lsm"
+	"github.com/util6/JadeDB/utils"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -51,13 +52,13 @@ func newOracle(opt Options) *oracle {
 		//
 		// WaterMarks must be 64-bit aligned for atomic package, hence we must use pointers here.
 		// See https://golang.org/pkg/sync/atomic/#pkg-note-BUG.
-		readMark:  &utils.WaterMark{Name: "corekv.PendingReads"},
-		txnMark:   &utils.WaterMark{Name: "corekv.TxnTimestamp"},
+		readMark:  utils.NewWaterMark(),
+		txnMark:   utils.NewWaterMark(),
 		closer:    utils.NewCloserInitial(2),
 		nextTxnTs: 1,
 	}
-	orc.readMark.Init(orc.closer)
-	orc.txnMark.Init(orc.closer)
+	orc.readMark.Init(0)
+	orc.txnMark.Init(0)
 	return orc
 }
 
@@ -76,7 +77,7 @@ func (o *oracle) readTs() uint64 {
 	// timestamp and are going through the write to value log and LSM tree
 	// process. Not waiting here could mean that some txns which have been
 	// committed would not be read.
-	utils.Check(o.txnMark.WaitForMark(context.Background(), readTs))
+	o.txnMark.WaitForMark(readTs)
 	return readTs
 }
 
@@ -303,7 +304,7 @@ func (txn *Txn) newPendingWritesIterator(reversed bool) *pendingWritesIterator {
 func (txn *Txn) checkSize(e *utils.Entry) error {
 	count := txn.count + 1
 	// Extra bytes for the version in key.
-	size := txn.size + int64(e.EstimateSize(int(txn.db.valueThreshold())+10))
+	size := txn.size + int64(e.EstimateSize(int(txn.db.valueThreshold)+10))
 	if count >= txn.db.opt.MaxBatchCount || size >= txn.db.opt.MaxBatchSize {
 		return utils.ErrTxnTooBig
 	}
@@ -411,7 +412,7 @@ func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
 	item.e = new(utils.Entry)
 	if txn.update {
 		if e, has := txn.pendingWrites[string(key)]; has && bytes.Equal(key, e.Key) {
-			if isDeletedOrExpired(e.Meta, e.ExpiresAt) {
+			if lsm.IsDeletedOrExpired(e) {
 				return nil, utils.ErrKeyNotFound
 			}
 			// Fulfill from cache.
@@ -436,7 +437,7 @@ func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
 	if vs.Value == nil && vs.Meta == 0 {
 		return nil, utils.ErrKeyNotFound
 	}
-	if isDeletedOrExpired(vs.Meta, vs.ExpiresAt) {
+	if lsm.IsDeletedOrExpired(&utils.Entry{Meta: vs.Meta, ExpiresAt: vs.ExpiresAt}) {
 		return nil, utils.ErrKeyNotFound
 	}
 

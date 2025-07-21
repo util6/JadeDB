@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rookieLiuyutao/corekv/utils"
+	"github.com/util6/JadeDB/utils"
 )
 
 var (

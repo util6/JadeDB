@@ -23,9 +23,9 @@ import (
 	"sort"
 	"unsafe"
 
-	"github.com/rookieLiuyutao/corekv/file"
-	"github.com/rookieLiuyutao/corekv/pb"
-	"github.com/rookieLiuyutao/corekv/utils"
+	"github.com/util6/JadeDB/file"
+	"github.com/util6/JadeDB/pb"
+	"github.com/util6/JadeDB/utils"
 )
 
 //-----------------------------------------------------SST在内存中的结构,需要做持久化操作-----------------------------------------------------------------------------------
@@ -410,7 +410,7 @@ func (tb *tableBuilder) flush(lm *levelManager, tableName string) (t *table, err
 	t = &table{lm: lm, fid: utils.FID(tableName)}
 
 	// 如果没有builder 则打开一个已经存在的sst文件
-	t.ss, _ = file.OpenSStable(&file.Options{
+	t.ss = file.OpenSStable(&file.Options{
 		FileName: tableName,
 		Dir:      lm.opt.WorkDir,
 		Flag:     os.O_CREATE | os.O_RDWR,

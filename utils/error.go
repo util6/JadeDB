@@ -40,6 +40,10 @@ var (
 	ErrTxnTooBig      = errors.New("Txn is too big to fit into one request")
 	ErrDeleteVlogFile = errors.New("Delete vlog file")
 	ErrNoRoom         = errors.New("No room for write")
+	ErrReadOnlyTxn    = errors.New("cannot perform write operation on read-only transaction")
+	ErrDiscardedTxn   = errors.New("this transaction has been discarded. Create a new one")
+	ErrConflict       = errors.New("transaction conflict")
+	ErrDBClosed       = errors.New("database is closed")
 
 	// ErrInvalidRequest is returned if the user request is invalid.
 	ErrInvalidRequest = errors.New("Invalid request")
@@ -56,6 +60,21 @@ func Panic(err error) {
 	if err != nil {
 		panic(err)
 	}
+}
+
+// Check 检查错误，如果有错误则 panic
+func Check(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+// Wrapf 包装错误并添加格式化消息
+func Wrapf(err error, format string, args ...interface{}) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf(format+": %w", append(args, err)...)
 }
 
 // Panic2 _

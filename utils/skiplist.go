@@ -531,7 +531,7 @@ func (s *SkipList) randomHeight() int {
 
 // ---------------------------------跳表迭代器相关方法----------------------------------------
 
-func (s *SkipList) newSkipListIterator() Iterator {
+func (s *SkipList) NewSkipListIterator() Iterator {
 	s.IncrRef()
 	return &SkipListIterator{list: s}
 }

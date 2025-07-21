@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package corekv
+package JadeDB
 
 import (
 	"bufio"
@@ -33,8 +33,8 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/rookieLiuyutao/corekv/file"
-	"github.com/rookieLiuyutao/corekv/utils"
+	"github.com/util6/JadeDB/file"
+	"github.com/util6/JadeDB/utils"
 )
 
 const discardStatsFlushThreshold = 100
@@ -116,7 +116,7 @@ func (vlog *valueLog) open(db *DB, ptr *utils.ValuePtr, replayFn utils.LogEntry)
 				if err := lf.Close(); err != nil {
 					return errors.Wrapf(err, "failed to close vlog file %s", lf.FileName())
 				}
-				path := vlog.fpath(lf.FID)
+				path := vlog.fpath(uint32(lf.FID))
 				if err := os.Remove(path); err != nil {
 					return errors.Wrapf(err, "failed to delete empty value log file: %q", path)
 				}
@@ -247,7 +247,7 @@ func (vlog *valueLog) write(reqs []*request) error {
 			}
 			var p utils.ValuePtr
 
-			p.Fid = curlf.FID
+			p.Fid = uint32(curlf.FID)
 			// Use the offset including buffer length so far.
 			p.Offset = vlog.woffset() + uint32(buf.Len())
 			plen, err := curlf.EncodeEntry(e, &buf, p.Offset) // Now encode the entry into buffer.
@@ -287,7 +287,7 @@ func (vlog *valueLog) close() error {
 	<-vlog.lfDiscardStats.closer.CloseSignal
 	var err error
 	for id, f := range vlog.filesMap {
-		f.Lock.Lock() // We won’t release the lock.
+		f.Lock() // We won’t release the lock.
 		maxFid := vlog.maxFid
 		if id == maxFid {
 			// truncate writable log file to correct offset.
@@ -298,7 +298,7 @@ func (vlog *valueLog) close() error {
 		if closeErr := f.Close(); closeErr != nil && err == nil {
 			err = closeErr
 		}
-		f.Lock.Unlock()
+		f.Unlock()
 	}
 	return err
 }
@@ -320,10 +320,10 @@ func (vlog *valueLog) runGC(discardRatio float64, head *utils.ValuePtr) error {
 		tried := make(map[uint32]bool)
 		for _, lf := range files {
 			//消重一下,防止随机策略和统计策略返回同一个fid
-			if _, done := tried[lf.FID]; done {
+			if _, done := tried[uint32(lf.FID)]; done {
 				continue
 			}
-			tried[lf.FID] = true
+			tried[uint32(lf.FID)] = true
 			if err = vlog.doRunGC(lf, discardRatio); err == nil {
 				return nil
 			}
@@ -339,7 +339,7 @@ func (vlog *valueLog) doRunGC(lf *file.LogFile, discardRatio float64) (err error
 	defer func() {
 		if err == nil {
 			vlog.lfDiscardStats.Lock()
-			delete(vlog.lfDiscardStats.m, lf.FID)
+			delete(vlog.lfDiscardStats.m, uint32(lf.FID))
 			vlog.lfDiscardStats.Unlock()
 		}
 	}()
@@ -391,14 +391,14 @@ func (vlog *valueLog) rewrite(f *file.LogFile) error {
 		var vp utils.ValuePtr
 		vp.Decode(vs.Value)
 
-		if vp.Fid > f.FID {
+		if vp.Fid > uint32(f.FID) {
 			return nil
 		}
 		if vp.Offset > e.Offset {
 			return nil
 		}
 		// 如果从lsm和vlog的同一个位置读取带entry则重新写回，也有可能读取到旧的
-		if vp.Fid == f.FID && vp.Offset == e.Offset {
+		if vp.Fid == uint32(f.FID) && vp.Offset == e.Offset {
 			moved++
 			// This new entry only contains the key, and a pointer to the value.
 			ne := new(utils.Entry)
@@ -460,15 +460,15 @@ func (vlog *valueLog) rewrite(f *file.LogFile) error {
 	{
 		vlog.filesLock.Lock()
 		// Just a sanity-check.
-		if _, ok := vlog.filesMap[f.FID]; !ok {
+		if _, ok := vlog.filesMap[uint32(f.FID)]; !ok {
 			vlog.filesLock.Unlock()
 			return errors.Errorf("Unable to find fid: %d", f.FID)
 		}
 		if vlog.iteratorCount() == 0 {
-			delete(vlog.filesMap, f.FID)
+			delete(vlog.filesMap, uint32(f.FID))
 			//deleteFileNow = true
 		} else {
-			vlog.filesToBeDeleted = append(vlog.filesToBeDeleted, f.FID)
+			vlog.filesToBeDeleted = append(vlog.filesToBeDeleted, uint32(f.FID))
 		}
 		vlog.filesLock.Unlock()
 	}
@@ -514,8 +514,8 @@ func (vlog *valueLog) deleteLogFile(lf *file.LogFile) error {
 	if lf == nil {
 		return nil
 	}
-	lf.Lock.Lock()
-	defer lf.Lock.Unlock()
+	lf.Lock()
+	defer lf.Unlock()
 	utils.Err(lf.Close())
 	return os.Remove(lf.FileName())
 }
@@ -559,7 +559,7 @@ func (vlog *valueLog) getUnlockCallback(lf *file.LogFile) func() {
 	if lf == nil {
 		return nil
 	}
-	return lf.Lock.RUnlock
+	return lf.RUnlock
 }
 
 // readValueBytes return vlog entry slice and read locked log file. Caller should take care of
@@ -570,7 +570,7 @@ func (vlog *valueLog) readValueBytes(vp *utils.ValuePtr) ([]byte, *file.LogFile,
 		return nil, nil, err
 	}
 
-	buf, err := lf.Read(vp)
+	buf, err := lf.ReadValuePtr(vp)
 	return buf, lf, err
 }
 
@@ -596,7 +596,7 @@ func (vlog *valueLog) getFileRLocked(vp *utils.ValuePtr) (*file.LogFile, error) 
 		}
 	}
 
-	ret.Lock.RLock()
+	ret.RLock()
 	return ret, nil
 }
 
@@ -628,8 +628,7 @@ func (vlog *valueLog) populateFilesMap() error {
 		found[fid] = struct{}{}
 
 		lf := &file.LogFile{
-			FID:  uint32(fid),
-			Lock: sync.RWMutex{},
+			FID: fid,
 		}
 		vlog.filesMap[uint32(fid)] = lf
 		if vlog.maxFid < uint32(fid) {
@@ -643,8 +642,7 @@ func (vlog *valueLog) createVlogFile(fid uint32) (*file.LogFile, error) {
 	path := vlog.fpath(fid)
 
 	lf := &file.LogFile{
-		FID:  fid,
-		Lock: sync.RWMutex{},
+		FID: uint64(fid),
 	}
 
 	var err error
@@ -718,7 +716,7 @@ func (vlog *valueLog) replayLog(lf *file.LogFile, offset uint32, replayFn utils.
 	// if endOffset <= vlogHeaderSize && lf.fid != vlog.maxFid {
 
 	if endOffset <= utils.VlogHeaderSize {
-		if lf.FID != vlog.maxFid {
+		if uint32(lf.FID) != vlog.maxFid {
 			return utils.ErrDeleteVlogFile
 		}
 		return lf.Bootstrap()
@@ -777,7 +775,7 @@ loop:
 		read.recordOffset += vp.Len
 
 		vp.Offset = e.Offset
-		vp.Fid = lf.FID
+		vp.Fid = uint32(lf.FID)
 		validEndOffset = read.recordOffset
 		if err := fn(e, &vp); err != nil {
 			if err == utils.ErrStop {
@@ -990,11 +988,11 @@ func (vlog *valueLog) sync(fid uint32) error {
 		vlog.filesLock.RUnlock()
 		return nil
 	}
-	curlf.Lock.RLock()
+	curlf.RLock()
 	vlog.filesLock.RUnlock()
 
 	err := curlf.Sync()
-	curlf.Lock.RUnlock()
+	curlf.RUnlock()
 	return err
 }
 
@@ -1181,9 +1179,9 @@ func (vlog *valueLog) sample(samp *sampler, discardRatio float64) (*reason, erro
 	// Skip data only if fromBeginning is set to false. Pick a random start point.
 	if !samp.fromBeginning {
 		// Pick a random start point for the log.
-		skipFirstM = float64(rand.Int63n(fileSize)) // Pick a random starting location.
-		skipFirstM -= sizeWindow                    // Avoid hitting EOF by moving back by window.
-		skipFirstM /= float64(utils.Mi)             // Convert to MBs.
+		skipFirstM = float64(rand.Int63n(int64(fileSize))) // Pick a random starting location.
+		skipFirstM -= sizeWindow                           // Avoid hitting EOF by moving back by window.
+		skipFirstM /= float64(utils.Mi)                    // Convert to MBs.
 	}
 	var skipped float64
 
@@ -1224,7 +1222,7 @@ func (vlog *valueLog) sample(samp *sampler, discardRatio float64) (*reason, erro
 		utils.CondPanic(len(entry.Value) <= 0, fmt.Errorf("len(entry.Value) <= 0"))
 		vp.Decode(entry.Value)
 
-		if vp.Fid > samp.lf.FID {
+		if vp.Fid > uint32(samp.lf.FID) {
 			// Value is present in a later log. Discard.
 			r.discard += esz
 			return nil

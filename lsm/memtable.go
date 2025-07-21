@@ -12,8 +12,8 @@ import (
 	"sync/atomic"
 
 	"github.com/pkg/errors"
-	"github.com/rookieLiuyutao/corekv/file"
-	"github.com/rookieLiuyutao/corekv/utils"
+	"github.com/util6/JadeDB/file"
+	"github.com/util6/JadeDB/utils"
 )
 
 const walFileExt string = ".wal"

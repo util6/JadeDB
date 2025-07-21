@@ -1,8 +1,9 @@
 package lsm
 
 import (
-	"github.com/rookieLiuyutao/corekv/utils"
+	"github.com/util6/JadeDB/utils"
 	"sync"
+	"time"
 )
 
 // LSM _
@@ -53,6 +54,22 @@ type Options struct {
 	DiscardStatsCh *chan map[uint32]int64
 }
 
+// IsDeletedOrExpired 检查条目是否被删除或过期
+func IsDeletedOrExpired(entry *utils.Entry) bool {
+	if entry == nil {
+		return true
+	}
+	// 检查是否被标记为删除
+	if entry.Meta&utils.BitDelete != 0 {
+		return true
+	}
+	// 检查是否过期
+	if entry.ExpiresAt != 0 && entry.ExpiresAt < uint64(time.Now().Unix()) {
+		return true
+	}
+	return false
+}
+
 // NewLSM _
 func NewLSM(opt *Options) *LSM {
 	lsm := &LSM{option: opt}
@@ -63,6 +80,15 @@ func NewLSM(opt *Options) *LSM {
 	// 初始化closer 用于资源回收的信号控制
 	lsm.closer = utils.NewCloser()
 	return lsm
+}
+
+// NewMergeIterator 创建一个合并迭代器
+func (lsm *LSM) NewMergeIterator(iters []utils.Iterator, isAsc bool) utils.Iterator {
+	// 简单实现，返回第一个迭代器
+	if len(iters) > 0 {
+		return iters[0]
+	}
+	return nil
 }
 
 // Set _

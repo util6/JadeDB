@@ -1,16 +1,16 @@
-package corekv
+package JadeDB
 
 import (
 	"expvar"
 	"fmt"
+	"github.com/util6/JadeDB/lsm"
+	"github.com/util6/JadeDB/utils"
 	"math"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/rookieLiuyutao/corekv/lsm"
-	"github.com/rookieLiuyutao/corekv/utils"
 )
 
 type (
@@ -27,15 +27,18 @@ type (
 	// DB 对外暴露的接口对象 全局唯一，持有各种资源句柄
 	DB struct {
 		sync.RWMutex
-		opt         *Options
-		lsm         *lsm.LSM
-		vlog        *valueLog
-		stats       *Stats
-		flushChan   chan flushTask // For flushing memtables.
-		writeCh     chan *request
-		blockWrites int32
-		vhead       *utils.ValuePtr
-		logRotates  int32
+		opt            *Options
+		lsm            *lsm.LSM
+		vlog           *valueLog
+		stats          *Stats
+		flushChan      chan flushTask // For flushing memtables.
+		writeCh        chan *request
+		blockWrites    int32
+		vhead          *utils.ValuePtr
+		logRotates     int32
+		valueThreshold int64
+		orc            *oracle
+		isClosed       int32 // 使用原子操作
 	}
 )
 
@@ -394,7 +397,7 @@ func (req *request) Wait() error {
 
 // 结构体
 type flushTask struct {
-	mt           *utils.Skiplist
+	mt           *utils.SkipList
 	vptr         *utils.ValuePtr
 	dropPrefixes [][]byte
 }
@@ -416,4 +419,9 @@ func (db *DB) pushHead(ft flushTask) error {
 		Value: val,
 	})
 	return nil
+}
+
+// IsClosed 检查数据库是否已关闭
+func (db *DB) IsClosed() bool {
+	return atomic.LoadInt32(&db.isClosed) != 0
 }

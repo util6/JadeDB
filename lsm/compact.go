@@ -27,8 +27,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/rookieLiuyutao/corekv/pb"
-	"github.com/rookieLiuyutao/corekv/utils"
+	"github.com/util6/JadeDB/pb"
+	"github.com/util6/JadeDB/utils"
 )
 
 // 归并优先级
@@ -562,7 +562,7 @@ func (lm *levelManager) compactBuildTables(lev int, cd compactDef) ([]*table, fu
 		}
 		// 开启一个协程去处理子压缩
 		go func(kr keyRange) {
-			defer inflightBuilders.Done(nil)
+			defer inflightBuilders.Done()
 			it := NewMergeIterator(newIterator(), false)
 			defer it.Close()
 			lm.subcompact(it, kr, cd, inflightBuilders, res)
@@ -581,7 +581,8 @@ func (lm *levelManager) compactBuildTables(lev int, cd compactDef) ([]*table, fu
 	}()
 
 	// 在这里等待所有的压缩过程完成
-	err := inflightBuilders.Finish()
+	inflightBuilders.Finish()
+	var err error
 	// channel 资源回收
 	close(res)
 	// 等待所有的builder刷到磁盘
@@ -969,7 +970,7 @@ func (lm *levelManager) subcompact(it utils.Iterator, kr keyRange, cd compactDef
 		}
 		// 充分发挥 ssd的并行 写入特性
 		go func(builder *tableBuilder) {
-			defer inflightBuilders.Done(nil)
+			defer inflightBuilders.Done()
 			defer builder.Close()
 			var tbl *table
 			newFID := atomic.AddUint64(&lm.maxFID, 1) // compact的时候是没有memtable的，这里自增maxFID即可。

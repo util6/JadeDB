@@ -1,7 +1,7 @@
-package corekv
+package JadeDB
 
 import (
-	"github.com/hardcore-os/corekv/utils"
+	"github.com/util6/JadeDB/utils"
 
 	"testing"
 	"time"
@@ -11,7 +11,7 @@ func FuzzAPI(f *testing.F) {
 	//添加种子语料，必须和闭包西数的模弼参数一一对应
 	f.Add([]byte("core"), []byte("kv"))
 	clearDir()
-	db, _ := Open(opt)
+	db := Open(opt)
 
 	defer func() { _ = db.Close() }()
 	//运行fuz2引学，不断生成测试用例进行测试

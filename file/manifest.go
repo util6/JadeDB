@@ -25,9 +25,9 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/rookieLiuyutao/corekv/utils"
+	"github.com/util6/JadeDB/utils"
 
-	"github.com/rookieLiuyutao/corekv/pb"
+	"github.com/util6/JadeDB/pb"
 
 	"github.com/pkg/errors"
 )

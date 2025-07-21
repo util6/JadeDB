@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package corekv
+package JadeDB
 
 import (
 	"fmt"
+	"github.com/util6/JadeDB/utils"
 	"testing"
 	"time"
-
-	"github.com/rookieLiuyutao/corekv/utils"
 )
 
 func TestAPI(t *testing.T) {

@@ -26,9 +26,9 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"github.com/rookieLiuyutao/corekv/file"
-	"github.com/rookieLiuyutao/corekv/pb"
-	"github.com/rookieLiuyutao/corekv/utils"
+	"github.com/util6/JadeDB/file"
+	"github.com/util6/JadeDB/pb"
+	"github.com/util6/JadeDB/utils"
 )
 
 type table struct {
@@ -66,7 +66,7 @@ func openTable(lm *levelManager, tableName string, builder *tableBuilder) *table
 		// 如果没有builder，则创建一个新的table，并尝试打开一个已经存在的sst文件
 		t = &table{lm: lm, fid: fid}
 
-		t.ss, _ = file.OpenSStable(&file.Options{
+		t.ss = file.OpenSStable(&file.Options{
 			FileName: tableName,
 			Dir:      lm.opt.WorkDir,
 			Flag:     os.O_CREATE | os.O_RDWR,

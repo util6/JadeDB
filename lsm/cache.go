@@ -1,7 +1,7 @@
 package lsm
 
 import (
-	coreCache "github.com/rookieLiuyutao/corekv/utils/cache"
+	coreCache "github.com/util6/JadeDB/utils/cache"
 )
 
 type cache struct {

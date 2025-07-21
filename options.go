@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package corekv
+package JadeDB
 
-import "github.com/rookieLiuyutao/corekv/utils"
+import "github.com/util6/JadeDB/utils"
 
 // Options corekv 总的配置文件
 type Options struct {
@@ -29,6 +29,7 @@ type Options struct {
 	ValueLogMaxEntries  uint32
 	LogRotatesToFlush   int32
 	MaxTableSize        int64
+	DetectConflicts     bool
 }
 
 // NewDefaultOptions 返回默认的options

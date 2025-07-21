@@ -3,8 +3,8 @@ package file
 import (
 	"github.com/golang/protobuf/proto"
 	"github.com/pkg/errors"
-	"github.com/rookieLiuyutao/corekv/pb"
-	"github.com/rookieLiuyutao/corekv/utils"
+	"github.com/util6/JadeDB/pb"
+	"github.com/util6/JadeDB/utils"
 	"sync"
 	"syscall"
 	"time"
