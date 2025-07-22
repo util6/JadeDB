@@ -1,8 +1,43 @@
+/*
+JadeDB 事务管理模块
+
+本模块实现了 JadeDB 的事务系统，提供 ACID 特性和 MVCC 支持。
+事务系统是数据库一致性和并发控制的核心组件。
+
+核心特性：
+1. MVCC（多版本并发控制）：通过时间戳实现快照隔离
+2. 冲突检测：检测并发事务之间的写写冲突
+3. 水位标记：管理事务的可见性和垃圾回收
+4. 原子提交：确保事务的原子性和一致性
+
+设计原理：
+- Oracle：事务协调器，管理时间戳分配和冲突检测
+- Transaction：事务实例，维护读写集合和状态
+- WaterMark：水位标记，跟踪事务的进度和可见性
+- Commit Pipeline：异步提交管道，优化提交性能
+
+事务隔离级别：
+- 快照隔离（Snapshot Isolation）：事务看到开始时的一致性快照
+- 写写冲突检测：防止并发写入相同键的冲突
+- 读已提交：读取操作总是看到已提交的数据
+
+性能优化：
+- 异步提交：减少事务提交的延迟
+- 批量处理：批量提交多个事务
+- 水位标记：高效的垃圾回收和可见性管理
+- 冲突缓存：缓存冲突检测结果
+
+适用场景：
+- 需要事务保证的应用
+- 高并发读写场景
+- 对数据一致性要求严格的系统
+- 需要快照隔离的应用
+*/
+
 package JadeDB
 
 import (
 	"bytes"
-
 	"encoding/hex"
 	"github.com/util6/JadeDB/lsm"
 	"github.com/util6/JadeDB/utils"
@@ -13,35 +48,88 @@ import (
 	"github.com/pkg/errors"
 )
 
+// oracle 是事务协调器，负责管理事务的时间戳分配、冲突检测和提交协调。
+// 它是 JadeDB 事务系统的核心组件，确保事务的 ACID 特性。
+//
+// 设计原理：
+// 1. 时间戳排序：为每个事务分配唯一的时间戳，确定事务顺序
+// 2. 冲突检测：跟踪已提交事务的写集合，检测写写冲突
+// 3. 水位管理：使用水位标记管理事务的可见性和垃圾回收
+// 4. 提交协调：确保事务按时间戳顺序提交到存储引擎
+//
+// 并发控制：
+// - 使用互斥锁保护时间戳分配和提交状态
+// - 使用水位标记实现无锁的可见性判断
+// - 支持高并发的读事务和适度并发的写事务
 type oracle struct {
-	detectConflicts bool // Determines if the txns should be checked for conflicts.
+	// 配置选项
 
-	sync.Mutex // For nextTxnTs and commits.
-	// writeChLock lock is for ensuring that transactions go to the write
-	// channel in the same order as their commit timestamps.
+	// detectConflicts 控制是否启用事务冲突检测。
+	// 启用时会检测并发事务之间的写写冲突。
+	// 禁用时可以提高性能，但可能导致数据不一致。
+	detectConflicts bool
+
+	// 时间戳管理（需要锁保护）
+
+	// Mutex 保护时间戳分配和提交状态。
+	// 确保时间戳的唯一性和提交顺序的正确性。
+	sync.Mutex
+
+	// writeChLock 确保事务按提交时间戳顺序写入存储引擎。
+	// 这个锁保证了事务提交的串行化，维护数据的一致性。
+	// 虽然会影响并发性能，但对正确性至关重要。
 	writeChLock sync.Mutex
-	nextTxnTs   uint64
 
-	// Used to block NewTransaction, so all previous commits ars visible to a new read.
+	// nextTxnTs 是下一个事务的时间戳。
+	// 每次创建新事务时递增，确保时间戳的唯一性和单调性。
+	// 时间戳用于实现 MVCC 和确定事务的可见性。
+	nextTxnTs uint64
+
+	// 可见性管理
+
+	// txnMark 用于阻塞新事务，确保所有先前的提交对新读事务可见。
+	// 这是实现快照隔离的关键机制。
+	// 新的读事务必须等待所有较早的写事务完成提交。
 	txnMark *utils.WaterMark
 
-	// Either of these is used to determine which versions can be permanently
-	// discarded during compaction.
-	discardTs uint64           // Used by ManagedDB.
-	readMark  *utils.WaterMark // Used by DB.
+	// 垃圾回收控制
 
-	// committedTxns contains all committed writes (contains fingerprints
-	// of keys written and their latest commit counter).
+	// discardTs 用于确定哪些版本可以在压缩时永久丢弃。
+	// 由 ManagedDB 使用，标记可以安全删除的旧版本数据。
+	discardTs uint64
+
+	// readMark 用于跟踪活跃的读事务，确定安全的垃圾回收点。
+	// 由普通 DB 使用，防止删除仍被读事务使用的数据版本。
+	readMark *utils.WaterMark
+
+	// 冲突检测
+
+	// committedTxns 包含所有已提交写事务的信息。
+	// 存储事务的时间戳和写入键的指纹，用于冲突检测。
+	// 定期清理旧的提交记录以控制内存使用。
 	committedTxns []committedTxn
+
+	// lastCleanupTs 记录上次清理提交记录的时间戳。
+	// 用于定期清理不再需要的冲突检测信息。
 	lastCleanupTs uint64
 
-	// closer is used to stop watermarks.
+	// 生命周期管理
+
+	// closer 用于停止水位标记和相关的后台进程。
+	// 确保在数据库关闭时正确清理资源。
 	closer *utils.Closer
 }
 
+// committedTxn 表示一个已提交的事务记录。
+// 用于冲突检测，存储事务的时间戳和写入的键集合。
 type committedTxn struct {
+	// ts 是事务的提交时间戳。
+	// 用于确定事务的提交顺序和可见性。
 	ts uint64
-	// ConflictKeys Keeps track of the entries written at timestamp ts.
+
+	// conflictKeys 跟踪在时间戳 ts 提交的事务写入的键。
+	// 存储键的哈希值（指纹），用于快速冲突检测。
+	// 使用 map[uint64]struct{} 实现高效的集合操作。
 	conflictKeys map[uint64]struct{}
 }
 

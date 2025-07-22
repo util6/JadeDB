@@ -12,6 +12,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/*
+JadeDB Manifest 文件管理模块
+
+Manifest 文件是 JadeDB 的元数据管理核心，记录了整个 LSM 树的结构信息。
+它类似于数据库的系统目录，维护着所有 SSTable 文件的元信息。
+
+核心功能：
+1. 元数据持久化：记录所有 SSTable 文件的位置和属性
+2. 系统恢复：在数据库重启时重建 LSM 树结构
+3. 一致性保证：确保文件操作的原子性和一致性
+4. 版本管理：跟踪文件的创建、删除和修改历史
+
+设计原理：
+- 追加写入：所有变更以追加方式写入，保证操作原子性
+- 检查点机制：定期重写文件，清理历史记录
+- 校验和保护：使用 CRC32 校验和防止数据损坏
+- 实时同步：不使用内存映射，确保数据实时写入磁盘
+
+文件格式：
+每个记录包含：[长度][数据][校验和]
+- 长度：4字节，记录数据部分的长度
+- 数据：变长，使用 Protocol Buffers 序列化
+- 校验和：4字节 CRC32，用于数据完整性验证
+
+应用场景：
+- 数据库启动时的状态恢复
+- SSTable 文件的生命周期管理
+- 压缩操作的元数据更新
+- 系统一致性检查和修复
+
+性能考虑：
+- 顺序写入：所有操作都是追加写入，性能较好
+- 批量操作：支持批量更新减少 I/O 次数
+- 内存缓存：在内存中维护完整的元数据副本
+- 定期重写：控制文件大小，避免过度增长
+*/
+
 package file
 
 import (
@@ -25,55 +62,131 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/util6/JadeDB/utils"
-
-	"github.com/util6/JadeDB/pb"
-
 	"github.com/pkg/errors"
+	"github.com/util6/JadeDB/pb"
+	"github.com/util6/JadeDB/utils"
 )
 
-// ManifestFile 维护sst文件元信息的文件
-// manifest 比较特殊，不能使用mmap，需要保证实时的写入
+// ManifestFile 表示 JadeDB 的清单文件管理器。
+// 清单文件是 LSM 树元数据的持久化存储，记录所有 SSTable 文件的信息。
+//
+// 设计特点：
+// 1. 实时写入：不使用内存映射，确保数据立即写入磁盘
+// 2. 追加模式：所有变更以追加方式记录，保证原子性
+// 3. 校验保护：每条记录都有 CRC32 校验和
+// 4. 定期重写：当删除记录过多时触发文件重写
+//
+// 并发安全：
+// 使用互斥锁保护所有操作，确保多线程环境下的数据一致性。
+//
+// 文件格式：
+// 每条记录：[4字节长度][变长数据][4字节CRC32]
 type ManifestFile struct {
-	opt                       *Options   // opt 用于存储ManifestFile的配置选项
-	f                         *os.File   // f 代表ManifestFile的底层操作系统文件句柄
-	lock                      sync.Mutex // lock 用于确保对ManifestFile的操作是线程安全的
-	deletionsRewriteThreshold int        // deletionsRewriteThreshold 表示触发重写操作的删除操作阈值
-	manifest                  *Manifest  // manifest 用于存储和管理具体的manifest文件内容
+	// 配置和文件句柄
+
+	// opt 存储清单文件的配置选项。
+	// 包含文件路径、权限设置等基本配置信息。
+	opt *Options
+
+	// f 是底层的操作系统文件句柄。
+	// 用于直接的文件读写操作，不使用缓冲或内存映射。
+	// 确保数据能够立即写入磁盘，提供最强的持久性保证。
+	f *os.File
+
+	// 并发控制
+
+	// lock 保护清单文件的所有操作。
+	// 确保读写操作的原子性和一致性。
+	// 虽然会影响并发性能，但对数据正确性至关重要。
+	lock sync.Mutex
+
+	// 维护策略
+
+	// deletionsRewriteThreshold 定义触发文件重写的删除操作阈值。
+	// 当累积的删除记录达到这个数量时，会重写整个文件。
+	// 重写可以清理历史记录，减小文件大小，提高读取性能。
+	deletionsRewriteThreshold int
+
+	// 内存状态
+
+	// manifest 是清单数据在内存中的完整副本。
+	// 提供快速的查询和更新操作，避免频繁的磁盘访问。
+	// 所有内存更新都会同步写入磁盘文件。
+	manifest *Manifest
 }
 
-// Manifest 是一个结构体，用于描述数据库或文件系统的manifest（清单）。
-// 它包含了数据层次结构、表格信息以及创建和删除操作的计数。
+// Manifest 表示 LSM 树的完整元数据结构。
+// 它是清单文件内容在内存中的表示，包含了重建 LSM 树所需的所有信息。
+//
+// 数据组织：
+// 1. 按层级组织：每个层级维护自己的文件列表
+// 2. 全局索引：通过文件 ID 快速查找文件信息
+// 3. 统计信息：跟踪文件创建和删除的历史
+//
+// 一致性保证：
+// 内存中的 Manifest 与磁盘文件保持严格同步。
 type Manifest struct {
-	// Levels 存储了按层次排列的levelManifest对象，每个levelManifest代表一个特定层次的数据信息。
+	// 层级结构
+
+	// Levels 存储各个层级的文件组织信息。
+	// 数组索引对应层级编号（0=L0, 1=L1, ...）。
+	// 每个 levelManifest 维护该层级中所有文件的 ID 集合。
 	Levels []levelManifest
 
-	// Tables 是一个映射，键是表格的唯一标识符（uint64类型），值是TableManifest对象，表示表格的详细信息。
+	// 文件索引
+
+	// Tables 是全局的文件信息映射表。
+	// 键是文件的唯一标识符（FID），值是文件的详细信息。
+	// 提供 O(1) 的文件信息查找能力。
 	Tables map[uint64]TableManifest
 
-	// Creations 记录了自manifest创建以来所创建的表格数量。
+	// 统计信息
+
+	// Creations 记录自清单创建以来的文件创建总数。
+	// 用于统计和监控，帮助了解系统的写入活动。
 	Creations int
 
-	// Deletions 记录了自manifest创建以来所删除的表格数量。
+	// Deletions 记录自清单创建以来的文件删除总数。
+	// 当删除数量过多时，会触发清单文件的重写操作。
+	// 重写可以清理历史记录，优化文件大小和读取性能。
 	Deletions int
 }
 
-// TableManifest 包含sst的基本信息
+// TableManifest 包含单个 SSTable 文件的基本元信息。
+// 这些信息用于文件管理、完整性检查和系统恢复。
 type TableManifest struct {
-	Level    uint8
-	Checksum []byte // 方便今后扩展
+	// Level 指定文件所属的层级（0-N）。
+	// L0 层的文件可能有重叠，其他层级的文件无重叠。
+	// 层级信息用于查询路由和压缩策略。
+	Level uint8
+
+	// Checksum 存储文件内容的校验和。
+	// 用于检测文件损坏和数据完整性验证。
+	// 预留字段，方便未来扩展更多的校验算法。
+	Checksum []byte
 }
 
-// levelManifest 结构体用于维护特定层级中的表ID集合。
-// 主要用于跟踪某一层级中存在的表。
+// levelManifest 维护特定层级中的文件集合。
+// 使用集合结构快速判断文件是否属于某个层级。
 type levelManifest struct {
-	Tables map[uint64]struct{} // 表ID集合
+	// Tables 存储该层级中所有文件的 ID 集合。
+	// 使用 map[uint64]struct{} 实现高效的集合操作。
+	// struct{} 不占用额外内存，只利用 map 的键来实现集合功能。
+	Tables map[uint64]struct{}
 }
 
-// TableMeta 表示 SST (Sorted String Table) 文件的元信息。
+// TableMeta 表示 SSTable 文件的元信息。
+// 用于文件创建、管理和完整性验证。
 type TableMeta struct {
-	ID       uint64 // - ID: SST 文件的唯一标识符。
-	Checksum []byte // - Checksum: SST 文件内容的校验和，用于数据完整性验证。
+	// ID 是 SSTable 文件的唯一标识符。
+	// 通常用作文件名的一部分，确保文件名的唯一性。
+	// 在整个数据库生命周期中保持唯一。
+	ID uint64
+
+	// Checksum 是文件内容的校验和。
+	// 用于验证文件的完整性，检测潜在的数据损坏。
+	// 支持多种校验算法，提供灵活的完整性保护。
+	Checksum []byte
 }
 
 // OpenManifestFile 打开manifest文件

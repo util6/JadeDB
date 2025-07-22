@@ -4,61 +4,232 @@
  * Licensed under the Apache License, Version 2.0 (the "License")
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+ *
  * http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-// Use protos/gen.sh to generate .pb.go files.
-syntax = "proto3";
 
+/*
+JadeDB Protocol Buffers 定义文件
+
+本文件定义了 JadeDB 中用于数据序列化和持久化的所有 Protocol Buffers 消息格式。
+这些消息格式用于：
+1. 数据存储：键值对的序列化格式
+2. 元数据管理：文件索引和清单信息
+3. 数据传输：流式处理和备份恢复
+4. 版本控制：支持 MVCC 和数据版本管理
+
+设计原则：
+- 向后兼容：新版本能够读取旧版本的数据
+- 空间效率：紧凑的二进制格式，减少存储开销
+- 类型安全：强类型定义，避免序列化错误
+- 扩展性：预留字段编号，支持未来扩展
+
+使用说明：
+使用 protos/gen.sh 脚本生成对应的 .pb.go 文件
+*/
+
+syntax = "proto3";
 package pb;
 
+// KV 表示一个键值对条目，是 JadeDB 中数据存储的基本单位。
+// 这个消息格式用于数据的序列化存储和网络传输。
+//
+// 支持特性：
+// - MVCC：通过 version 字段支持多版本并发控制
+// - TTL：通过 expires_at 字段支持数据过期
+// - 元数据：支持用户自定义和系统元数据
+// - 流式处理：支持数据流的标识和处理
+//
+// 存储位置：
+// - WAL 文件：事务日志中的条目格式
+// - SSTable：磁盘文件中的数据格式
+// - 内存表：内存中的数据表示
+// - 网络传输：备份和同步时的传输格式
 message KV {
+  // key 是条目的键，用于唯一标识数据。
+  // 支持任意字节序列，通常是字符串的 UTF-8 编码。
+  // 在 LSM 树中按字典序排列。
   bytes key = 1;
+
+  // value 是条目的值，存储实际的数据内容。
+  // 支持任意字节序列，可以是文本、二进制数据或序列化对象。
+  // 大值可能存储在值日志中，这里只保存值指针。
   bytes value = 2;
+
+  // user_meta 是用户自定义的元数据。
+  // 应用程序可以在这里存储额外的信息，如数据类型、编码格式等。
+  // 不参与 JadeDB 的内部逻辑，完全由应用程序控制。
   bytes user_meta = 3;
+
+  // version 是条目的版本号，用于 MVCC（多版本并发控制）。
+  // 通常是事务的时间戳，确保版本的唯一性和单调性。
+  // 用于实现快照隔离和冲突检测。
   uint64 version = 4;
+
+  // expires_at 是条目的过期时间戳（Unix 纳秒）。
+  // 0 表示永不过期，非零值表示具体的过期时间。
+  // 过期的数据在读取时会被过滤，在压缩时会被清理。
   uint64 expires_at = 5;
+
+  // meta 是系统内部使用的元数据。
+  // 包含删除标记、值指针标记等系统级信息。
+  // 应用程序不应直接修改这个字段。
   bytes meta = 6;
 
-  // Stream id is used to identify which stream the KV came from.
+  // stream_id 用于标识数据来源的流。
+  // 在流式处理、备份恢复等场景中用于数据分组和路由。
+  // 支持并行处理和数据一致性检查。
   uint32 stream_id = 10;
 }
 
+// KVList 表示一组键值对的集合。
+// 用于批量操作、事务处理和数据传输场景。
+//
+// 使用场景：
+// - 批量写入：一次性写入多个键值对
+// - 事务操作：原子性地处理多个操作
+// - 数据导入：批量导入外部数据
+// - 网络传输：减少网络往返次数
+//
+// 性能优势：
+// - 减少序列化开销：批量序列化比单个序列化更高效
+// - 减少网络开销：一次传输多个条目
+// - 提高缓存效率：批量操作可以更好地利用缓存
 message KVList {
+  // kv 是键值对的列表。
+  // 支持任意数量的键值对，受内存和网络限制。
+  // 在批量操作中按顺序处理。
   repeated KV kv = 1;
 }
 
+// ManifestChangeSet 表示一组原子性的清单变更操作。
+// 用于确保 LSM 树元数据的一致性和原子性更新。
+//
+// 原子性保证：
+// - 所有变更要么全部成功，要么全部失败
+// - 不会出现部分成功的中间状态
+// - 支持事务性的元数据更新
+//
+// 使用场景：
+// - 文件创建：新 SSTable 文件的注册
+// - 文件删除：过期文件的清理
+// - 压缩操作：多个文件的原子性替换
+// - 系统恢复：从日志重放变更操作
 message ManifestChangeSet {
-        // A set of changes that are applied atomically.
-        repeated ManifestChange changes = 1;
+  // changes 是要原子性应用的变更列表。
+  // 所有变更按顺序执行，确保操作的一致性。
+  // 如果任何一个变更失败，整个变更集都会回滚。
+  repeated ManifestChange changes = 1;
 }
 
+// ManifestChange 表示对 LSM 树元数据的单个变更操作。
+// 记录文件的创建、删除等生命周期事件。
+//
+// 操作类型：
+// - CREATE：创建新文件，需要提供完整的文件信息
+// - DELETE：删除现有文件，只需要文件 ID
+//
+// 持久化：
+// - 所有变更都会记录到清单文件中
+// - 支持系统重启后的状态恢复
+// - 提供操作的审计跟踪
 message ManifestChange {
-        uint64 Id = 1;
-        enum Operation {
-                CREATE = 0;
-                DELETE = 1;
-        }
-        Operation Op   = 2;
-        uint32 Level   = 3; // Only used for CREATE
-        bytes Checksum = 4; // Only used for CREATE
-}
-message TableIndex{
-        repeated BlockOffset offsets = 1;
-        bytes  bloomFilter = 2;
-        uint64 maxVersion = 3;
-        uint32 keyCount = 4;
-        uint32 staleDataSize = 5;
+  // Id 是文件的唯一标识符。
+  // 在整个数据库生命周期中保持唯一。
+  // 用于文件管理和引用。
+  uint64 Id = 1;
+
+  // Operation 定义了变更操作的类型。
+  enum Operation {
+    CREATE = 0;  // 创建新文件
+    DELETE = 1;  // 删除现有文件
+  }
+
+  // Op 指定要执行的操作类型。
+  Operation Op = 2;
+
+  // Level 指定文件所属的 LSM 树层级。
+  // 只在 CREATE 操作中使用。
+  // 用于文件的分层管理和查询路由。
+  uint32 Level = 3;
+
+  // Checksum 是文件内容的校验和。
+  // 只在 CREATE 操作中使用。
+  // 用于验证文件完整性和检测损坏。
+  bytes Checksum = 4;
 }
 
-message BlockOffset{
-        bytes key = 1;
-        uint32 offset = 2;
-        uint32 len = 3;
+// TableIndex 表示 SSTable 文件的索引信息。
+// 包含了快速访问文件内容所需的所有元数据。
+//
+// 索引作用：
+// - 快速定位：通过块偏移快速定位数据
+// - 过滤查询：通过布隆过滤器快速过滤
+// - 统计信息：提供文件的统计数据
+// - 版本管理：跟踪文件中的数据版本
+//
+// 存储位置：
+// - 文件末尾：索引存储在 SSTable 文件的末尾
+// - 内存缓存：热点文件的索引会被缓存
+// - 清单文件：部分索引信息记录在清单中
+message TableIndex {
+  // offsets 是数据块的偏移信息列表。
+  // 每个块的起始键、文件偏移和长度信息。
+  // 支持二分查找快速定位目标数据块。
+  repeated BlockOffset offsets = 1;
+
+  // bloomFilter 是文件的布隆过滤器数据。
+  // 用于快速判断键是否可能存在于文件中。
+  // 可以显著减少不必要的磁盘访问。
+  bytes bloomFilter = 2;
+
+  // maxVersion 是文件中所有数据的最大版本号。
+  // 用于 MVCC 和垃圾回收决策。
+  // 帮助确定文件的数据新旧程度。
+  uint64 maxVersion = 3;
+
+  // keyCount 是文件中键的总数量。
+  // 用于统计和容量规划。
+  // 帮助评估文件的数据密度。
+  uint32 keyCount = 4;
+
+  // staleDataSize 是文件中过期数据的字节大小。
+  // 用于垃圾回收和压缩决策。
+  // 帮助确定文件的压缩优先级。
+  uint32 staleDataSize = 5;
+}
+
+// BlockOffset 表示数据块在文件中的位置信息。
+// 用于构建文件索引，支持快速的随机访问。
+//
+// 索引结构：
+// - 有序存储：按键的字典序排列
+// - 二分查找：支持 O(log n) 的查找复杂度
+// - 范围查询：支持高效的范围扫描
+//
+// 使用场景：
+// - 点查询：快速定位特定键所在的数据块
+// - 范围查询：确定查询范围涉及的数据块
+// - 迭代器：支持有序遍历数据
+message BlockOffset {
+  // key 是数据块中的起始键。
+  // 用于二分查找定位目标数据块。
+  // 必须与数据块中的实际起始键一致。
+  bytes key = 1;
+
+  // offset 是数据块在文件中的字节偏移量。
+  // 从文件开头计算的绝对位置。
+  // 用于直接定位和读取数据块。
+  uint32 offset = 2;
+
+  // len 是数据块的字节长度。
+  // 用于确定读取的数据量。
+  // 包括块头、数据和校验和的总长度。
+  uint32 len = 3;
 }

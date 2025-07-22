@@ -12,6 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/*
+JadeDB 值日志（Value Log）模块
+
+值日志是 JadeDB 实现值分离存储的核心组件，专门用于存储大值数据。
+这种设计可以显著减少 LSM 树的写放大问题，提高整体性能。
+
+核心设计原理：
+1. 值分离：大于阈值的值存储在值日志中，LSM 树只存储指针
+2. 顺序写入：所有值按顺序追加写入，充分利用磁盘顺序写性能
+3. 垃圾回收：定期清理无效数据，回收磁盘空间
+4. 并发安全：支持多线程并发读写，使用细粒度锁控制
+
+主要组件：
+- 日志文件：存储实际值数据的文件，按 FID 编号
+- 文件管理：管理多个日志文件的生命周期
+- 垃圾回收：清理过期和删除的数据
+- 统计信息：跟踪空间使用和回收效果
+
+性能优势：
+- 减少写放大：大值不参与 LSM 树的压缩过程
+- 提高缓存效率：LSM 树更小，缓存命中率更高
+- 优化垃圾回收：批量回收，减少碎片化
+- 支持大值：可以存储任意大小的值
+
+适用场景：
+- 存储大型对象（图片、文档、序列化数据）
+- 写入密集型应用
+- 需要高效垃圾回收的场景
+- 对写放大敏感的系统
+*/
+
 package JadeDB
 
 import (
@@ -37,28 +68,104 @@ import (
 	"github.com/util6/JadeDB/utils"
 )
 
-const discardStatsFlushThreshold = 100
+const (
+	// discardStatsFlushThreshold 定义丢弃统计信息的刷新阈值。
+	// 当累积的丢弃统计达到这个数量时，会触发批量刷新到磁盘。
+	// 这种批量处理可以减少磁盘 I/O 次数，提高性能。
+	discardStatsFlushThreshold = 100
+)
 
-var lfDiscardStatsKey = []byte("!corekv!discard") // For storing lfDiscardStats
+var (
+	// lfDiscardStatsKey 是存储丢弃统计信息的特殊键。
+	// 使用特殊前缀确保不与用户数据冲突。
+	// 这个键用于在 LSM 树中持久化垃圾回收的统计信息。
+	lfDiscardStatsKey = []byte("!corekv!discard")
+)
 
-// valueLog
+// valueLog 表示值日志的核心实现。
+// 它负责管理大值的存储、读取、垃圾回收和文件生命周期。
+//
+// 设计原理：
+// 1. 文件分片：使用多个日志文件，每个文件有唯一的 FID
+// 2. 顺序写入：新数据总是追加到当前活跃文件的末尾
+// 3. 随机读取：通过值指针快速定位和读取数据
+// 4. 垃圾回收：定期清理无效数据，回收磁盘空间
+//
+// 并发模型：
+// - 读操作：多个读操作可以并发执行
+// - 写操作：写操作是串行的，但可以批量处理
+// - 垃圾回收：在后台异步执行，不阻塞读写操作
+//
+// 文件格式：
+// 每个条目在文件中的格式为：
+// [Header][Key][Value][Checksum]
 type valueLog struct {
+	// 基础配置
+
+	// dirPath 指定值日志文件的存储目录。
+	// 所有的 .vlog 文件都存储在这个目录中。
 	dirPath string
 
-	// guards our view of which files exist, which to be deleted, how many active iterators
-	filesLock        sync.RWMutex
-	filesMap         map[uint32]*file.LogFile
-	maxFid           uint32
+	// 文件管理（需要锁保护）
+
+	// filesLock 保护文件相关的数据结构。
+	// 使用读写锁允许多个读操作并发执行。
+	// 写操作（如创建、删除文件）需要写锁。
+	filesLock sync.RWMutex
+
+	// filesMap 维护所有活跃日志文件的映射。
+	// 键是文件 ID（FID），值是对应的日志文件对象。
+	// 用于快速查找和访问特定的日志文件。
+	filesMap map[uint32]*file.LogFile
+
+	// maxFid 跟踪当前最大的文件 ID。
+	// 用于生成新文件的唯一标识符。
+	// 每次创建新文件时递增。
+	maxFid uint32
+
+	// filesToBeDeleted 存储待删除的文件 ID 列表。
+	// 这些文件已经被标记为删除，但可能还有活跃的迭代器在使用。
+	// 当所有迭代器关闭后，这些文件会被物理删除。
 	filesToBeDeleted []uint32
-	// A refcount of iterators -- when this hits zero, we can delete the filesToBeDeleted.
+
+	// numActiveIterators 跟踪活跃迭代器的数量。
+	// 使用原子操作确保并发安全。
+	// 当这个计数为零时，可以安全删除标记的文件。
 	numActiveIterators int32
 
-	db                *DB
-	writableLogOffset uint32 // read by read, written by write. Must access via atomics.
-	numEntriesWritten uint32
-	opt               Options
+	// 数据库集成
 
-	garbageCh      chan struct{}
+	// db 指向所属的数据库实例。
+	// 用于访问数据库的配置和其他组件。
+	db *DB
+
+	// 写入状态（需要原子操作）
+
+	// writableLogOffset 记录当前可写文件的写入偏移量。
+	// 使用原子操作确保并发安全。
+	// 读操作通过原子加载获取，写操作通过原子存储更新。
+	writableLogOffset uint32
+
+	// numEntriesWritten 记录已写入的条目数量。
+	// 用于统计和监控目的。
+	// 可以帮助决定何时轮转到新文件。
+	numEntriesWritten uint32
+
+	// 配置选项
+
+	// opt 包含值日志的配置选项。
+	// 包括文件大小限制、垃圾回收参数等。
+	opt Options
+
+	// 垃圾回收
+
+	// garbageCh 用于触发垃圾回收操作的通道。
+	// 后台 goroutine 监听这个通道，收到信号时执行垃圾回收。
+	garbageCh chan struct{}
+
+	// lfDiscardStats 管理丢弃统计信息。
+	// 跟踪每个文件中无效数据的数量和大小。
+	// 用于垃圾回收决策和空间回收优化。
 	lfDiscardStats *lfDiscardStats
 }
 

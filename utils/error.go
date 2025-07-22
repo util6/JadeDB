@@ -53,6 +53,11 @@ var (
 	// ErrRejected is returned if a valueIndex log GC is called either while another GC is running, or
 	// after DB::Close has been called.
 	ErrRejected = errors.New("Value log GC request rejected")
+
+	// 优化相关错误
+	ErrTaskQueueFull = errors.New("Task queue is full")
+	ErrTaskTimeout   = errors.New("Task execution timeout")
+	ErrTaskPanic     = errors.New("Task execution panic")
 )
 
 // Panic 如果err 不为nil 则panicc

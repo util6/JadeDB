@@ -12,6 +12,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/*
+LSM 树压缩（Compaction）模块
+
+压缩是 LSM 树的核心机制，负责将多个 SSTable 文件合并成更少、更大的文件。
+这个过程对于维护 LSM 树的性能和空间效率至关重要。
+
+核心功能：
+1. 层级压缩：将上层的文件合并到下层，减少文件数量
+2. 数据去重：移除重复和过期的数据，回收存储空间
+3. 有序维护：确保每层内部和层间的数据有序性
+4. 性能优化：减少读放大，提高查询效率
+
+压缩策略：
+- L0 -> L1：特殊处理，因为 L0 文件可能重叠
+- L1 -> L2...Ln：标准压缩，选择重叠文件进行合并
+- 大小控制：每层有大小限制，超限时触发压缩
+- 优先级调度：根据层级大小和文件数量计算压缩优先级
+
+设计原理：
+1. 分层压缩：每层大小递增，形成金字塔结构
+2. 异步执行：压缩在后台进行，不阻塞读写操作
+3. 并发控制：多个压缩器并行工作，提高效率
+4. 原子操作：压缩过程保证数据一致性
+
+性能考虑：
+- 写放大：压缩会导致数据重复写入，需要平衡
+- 读放大：减少文件数量可以降低读放大
+- 空间放大：临时存储压缩结果需要额外空间
+- CPU 使用：压缩是 CPU 密集型操作
+
+调度算法：
+- 优先级计算：基于层级大小和目标大小的比值
+- 负载均衡：多个压缩器协调工作，避免冲突
+- 自适应调整：根据系统负载动态调整压缩频率
+- 资源控制：限制并发压缩数量，避免资源竞争
+*/
+
 package lsm
 
 import (
@@ -31,37 +68,132 @@ import (
 	"github.com/util6/JadeDB/utils"
 )
 
-// 归并优先级
+// compactionPriority 表示压缩操作的优先级信息。
+// 用于压缩调度器决定哪个层级最需要进行压缩操作。
+//
+// 优先级计算考虑因素：
+// 1. 层级大小与目标大小的比值
+// 2. 文件数量与理想数量的比值
+// 3. 读写负载和系统资源状况
+// 4. 数据的时效性和访问频率
 type compactionPriority struct {
-	level        int
-	score        float64
-	adjusted     float64
+	// level 指定需要压缩的层级编号（0-N）。
+	// L0 层有特殊的压缩规则，因为文件间可能重叠。
+	level int
+
+	// score 是该层级的原始压缩分数。
+	// 基于层级大小与目标大小的比值计算。
+	// 分数越高，压缩优先级越高。
+	score float64
+
+	// adjusted 是调整后的压缩分数。
+	// 考虑了系统负载、并发压缩数量等因素。
+	// 用于最终的压缩调度决策。
+	adjusted float64
+
+	// dropPrefixes 指定在压缩过程中需要丢弃的键前缀。
+	// 用于实现数据的逻辑删除和空间回收。
+	// 匹配这些前缀的键值对会在压缩时被移除。
 	dropPrefixes [][]byte
-	t            targets
+
+	// t 包含压缩的目标配置信息。
+	// 定义了各层级的目标大小和文件大小限制。
+	t targets
 }
 
-// 归并目标
+// targets 定义了 LSM 树各层级的目标配置。
+// 这些目标用于指导压缩策略和层级管理。
+//
+// 配置原理：
+// - 每层大小按倍数递增，形成金字塔结构
+// - 文件大小在不同层级可以不同，优化访问模式
+// - 基础层级决定了整个 LSM 树的容量规划
 type targets struct {
+	// baseLevel 指定开始应用大小限制的基础层级。
+	// 通常是 L1，L0 层有特殊处理规则。
+	// 基础层级以下的层级大小会按倍数递增。
 	baseLevel int
-	targetSz  []int64
-	fileSz    []int64
-}
-type compactDef struct {
-	compactorId int
-	t           targets
-	p           compactionPriority
-	thisLevel   *levelHandler
-	nextLevel   *levelHandler
 
+	// targetSz 定义每个层级的目标总大小（字节）。
+	// 数组索引对应层级编号，值为该层级的目标大小。
+	// 用于计算压缩优先级和触发压缩操作。
+	targetSz []int64
+
+	// fileSz 定义每个层级中单个文件的目标大小（字节）。
+	// 不同层级可以有不同的文件大小策略。
+	// 影响文件的分割和合并决策。
+	fileSz []int64
+}
+
+// compactDef 定义了一次具体的压缩操作。
+// 包含了执行压缩所需的所有信息和资源。
+//
+// 压缩流程：
+// 1. 选择源层级和目标层级
+// 2. 确定参与压缩的文件集合
+// 3. 计算键范围和分割策略
+// 4. 执行合并和写入操作
+// 5. 更新元数据和清理旧文件
+type compactDef struct {
+	// 压缩器标识和配置
+
+	// compactorId 标识执行此压缩的压缩器编号。
+	// 用于日志记录、监控和调试。
+	// 多个压缩器可以并行工作。
+	compactorId int
+
+	// t 包含压缩的目标配置信息。
+	// 从压缩优先级中复制而来。
+	t targets
+
+	// p 包含此次压缩的优先级信息。
+	// 用于记录压缩的原因和重要性。
+	p compactionPriority
+
+	// 层级处理器
+
+	// thisLevel 是源层级的处理器。
+	// 提供源文件的访问和管理功能。
+	thisLevel *levelHandler
+
+	// nextLevel 是目标层级的处理器。
+	// 负责接收压缩后的新文件。
+	nextLevel *levelHandler
+
+	// 文件集合
+
+	// top 包含源层级参与压缩的文件。
+	// 这些文件的内容会被读取和合并。
 	top []*table
+
+	// bot 包含目标层级参与压缩的文件。
+	// 这些文件与源文件有键范围重叠。
 	bot []*table
 
-	thisRange keyRange
-	nextRange keyRange
-	splits    []keyRange
+	// 键范围管理
 
+	// thisRange 是源层级文件覆盖的键范围。
+	// 用于确定需要处理的数据范围。
+	thisRange keyRange
+
+	// nextRange 是目标层级文件覆盖的键范围。
+	// 包含所有参与压缩的文件的键范围。
+	nextRange keyRange
+
+	// splits 定义输出文件的分割点。
+	// 用于将压缩结果分割成多个文件。
+	splits []keyRange
+
+	// 统计信息
+
+	// thisSize 记录源层级文件的总大小。
+	// 用于统计和监控压缩的数据量。
 	thisSize int64
 
+	// 数据过滤
+
+	// dropPrefixes 指定需要在压缩时丢弃的键前缀。
+	// 实现数据的逻辑删除和空间回收。
 	dropPrefixes [][]byte
 }
 

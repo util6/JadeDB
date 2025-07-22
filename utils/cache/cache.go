@@ -1,3 +1,43 @@
+/*
+JadeDB 高性能缓存系统
+
+本模块实现了一个高性能的多层级缓存系统，结合了多种先进的缓存算法和数据结构。
+该缓存系统专门为 JadeDB 的读取密集型工作负载优化，提供卓越的命中率和性能。
+
+核心设计理念：
+1. 多层级架构：Window LRU + Segmented LRU 的两级缓存结构
+2. 智能准入控制：使用布隆过滤器和频率估计进行准入决策
+3. 自适应调整：动态调整缓存策略以适应不同的访问模式
+4. 高并发支持：读写锁保护，支持高并发访问
+
+缓存层级结构：
+┌─────────────┐    ┌──────────────────────────────┐
+│ Window LRU  │───▶│     Segmented LRU            │
+│ (热点缓存)   │    │ ┌─────────────┬─────────────┐ │
+│             │    │ │ Probation   │ Protected   │ │
+│             │    │ │ (试用区)     │ (保护区)     │ │
+└─────────────┘    │ └─────────────┴─────────────┘ │
+                   └──────────────────────────────┘
+
+算法特性：
+- Window LRU：快速响应突发访问，捕获短期热点
+- Segmented LRU：长期热点数据保护，防止缓存污染
+- 布隆过滤器：快速过滤一次性访问，减少缓存污染
+- Count-Min Sketch：高效的频率估计，支持准入决策
+
+性能优势：
+- 高命中率：多层级设计适应不同访问模式
+- 低延迟：O(1) 访问时间，高效的数据结构
+- 内存效率：紧凑的数据布局，最小化内存开销
+- 并发友好：读写锁设计，支持高并发访问
+
+适用场景：
+- 数据库缓存系统
+- 高频读取的键值存储
+- 需要高命中率的缓存场景
+- 访问模式复杂的应用系统
+*/
+
 package cache
 
 import (
@@ -7,105 +47,223 @@ import (
 	"unsafe"
 )
 
-/*
-Cache 结构体代表一个缓存系统，该系统采用多种缓存策略和技术来优化存储和检索效率。
-它结合了限长缓存（window LRU），分段 LRU（segmented LRU），布隆过滤器（Bloom Filter）
-以及计数迷你缩略图（count-min sketch）等多种方法来管理缓存数据。
-
-	缓存策略：
-
-如果需要淘汰的时候，需要判断是否出现过，bloom,出现过才能往slu放，只访问一次的也就是说，如果一个数据来了一次，在win被淘汰，如果slru满了，
-如果w满了，slu也满了，但是这个数据没出现过，会导致w中的直接淘汰了，但是此时bloom会有计数。如果下一次又进入Iru,又被淘汰，就会进入probation
-综上
-如果只出现一次，会在window-lru被淘汰。
-如果突发性的频繁访问，可能会保留在window-lru,或者进入slru的`probation`区，并经过保活机制。
-如果热点数据，肯定会进入slru的protected区。
-*/
+// Cache 实现了一个高性能的多层级缓存系统。
+// 它结合了 Window LRU、Segmented LRU、布隆过滤器和 Count-Min Sketch 等多种技术。
+//
+// 缓存策略详解：
+//
+// 1. 数据首次访问：
+//   - 进入 Window LRU（热点捕获区）
+//   - 布隆过滤器记录访问历史
+//   - Count-Min Sketch 记录访问频率
+//
+// 2. 数据再次访问：
+//   - 如果在 Window LRU 中：提升优先级
+//   - 如果被淘汰但有访问历史：进入 Segmented LRU 的 Probation 区
+//
+// 3. 高频数据晋升：
+//   - 从 Probation 区晋升到 Protected 区
+//   - 长期保护热点数据不被淘汰
+//
+// 4. 缓存污染防护：
+//   - 一次性访问的数据只在 Window LRU 中短暂停留
+//   - 布隆过滤器防止无效数据进入长期缓存
+//
+// 并发安全：
+// 使用读写锁保护所有操作，支持多读者单写者模式。
 type Cache struct {
-	// m 用于同步访问缓存数据，确保并发安全。
+	// 并发控制
+
+	// m 保护缓存的所有数据结构。
+	// 使用读写锁允许多个读操作并发执行。
+	// 写操作（插入、删除、更新）需要独占访问。
 	m sync.RWMutex
-	// lru 作为短时高频数据的缓存策略，windowLRU 是一种基于滑动窗口的 LRU 缓存策略。
+
+	// 第一级缓存：Window LRU
+
+	// lru 是窗口 LRU 缓存，用于捕获短期热点数据。
+	// 特点：
+	// - 容量较小（通常占总容量的 10%）
+	// - 快速响应突发访问模式
+	// - 作为进入长期缓存的门槛
 	lru *windowLRU
-	// slru 用于存储较长时间未被访问的数据，segmentedLRU 是一种分段的 LRU 缓存策略，
-	// 它可以更有效地管理大量缓存数据。
+
+	// 第二级缓存：Segmented LRU
+
+	// slru 是分段 LRU 缓存，用于长期存储热点数据。
+	// 分为两个区域：
+	// - Probation：试用区，新晋升的数据
+	// - Protected：保护区，经过验证的热点数据
 	slru *segmentedLRU
-	// door 用作快速判断某数据是否存在，使用布隆过滤器可以快速判断某数据是否存在缓存中，
-	// 但可能会有误判。
+
+	// 准入控制组件
+
+	// door 是布隆过滤器，用于快速判断数据是否曾经被访问。
+	// 功能：
+	// - 防止一次性访问数据污染长期缓存
+	// - 快速过滤，减少不必要的缓存操作
+	// - 可能有假阳性，但无假阴性
 	door *BloomFilter
-	// c 用于估计大量数据的频次，count-min sketch 是一种概率数据结构，用于估计数据流中
-	// 各项的频次。
+
+	// 频率估计组件
+
+	// c 是 Count-Min Sketch，用于估计数据的访问频率。
+	// 功能：
+	// - 高效的频率统计，空间复杂度低
+	// - 支持大规模数据的频率估计
+	// - 用于缓存晋升和淘汰决策
 	c *cmSketch
-	// t 用于调整缓存策略的灵敏度，是一个动态调整的阈值。
+
+	// 动态调整参数
+
+	// t 是动态调整的阈值，用于控制缓存策略的敏感度。
+	// 根据访问模式自动调整，优化缓存性能。
 	t int32
-	// threshold 用于区分数据是否应该从 lru 晋级到 slru，确保高频数据能够被快速访问。
+
+	// threshold 是频率阈值，用于判断数据是否应该从 Window LRU 晋升到 Segmented LRU。
+	// 基于 Count-Min Sketch 的频率估计进行判断。
 	threshold int32
-	// data 用于存储具体的缓存数据，键是数据的唯一标识，值是双向链表的元素，
-	// 这样可以在 O(1) 的时间复杂度内访问和移除数据。
+
+	// 数据存储
+
+	// data 是主要的数据存储结构。
+	// 键：数据的哈希值（uint64）
+	// 值：双向链表中的元素指针
+	// 设计优势：
+	// - O(1) 的查找时间复杂度
+	// - O(1) 的插入和删除时间复杂度
+	// - 内存效率高，减少指针开销
 	data map[uint64]*list.Element
 }
 
+// Options 定义缓存的配置选项。
+// 当前主要用于控制各个缓存层级的容量分配比例。
 type Options struct {
+	// lruPct 指定 Window LRU 占总容量的百分比。
+	// 影响短期热点数据的捕获能力。
 	lruPct uint8
 }
 
-// NewCache size 指的是要缓存的数据个数
-// NewCache 创建并返回一个新的缓存实例。
-
+// NewCache 创建一个新的多层级缓存实例。
+// 这是缓存系统的主要构造函数，负责初始化所有组件和设置容量分配。
+//
+// 参数说明：
+// size: 缓存的总容量（条目数量）
+//
+// 返回值：
+// 完全初始化的缓存实例
+//
+// 容量分配策略：
+// 1. Window LRU：10% 的总容量，用于捕获短期热点
+// 2. Segmented LRU：90% 的总容量，分为两个阶段：
+//   - Probation（试用区）：20% 的 SLRU 容量
+//   - Protected（保护区）：80% 的 SLRU 容量
+//
+// 设计考虑：
+// - 10% 的 Window LRU 足以捕获大部分突发访问
+// - 90% 的 Segmented LRU 提供长期的热点保护
+// - 2:8 的试用区/保护区比例平衡了过滤效果和保护能力
+//
+// 组件初始化：
+// - 布隆过滤器：1% 的假阳性率，平衡准确性和性能
+// - Count-Min Sketch：基于总容量设置，提供频率估计
+// - 共享哈希表：所有层级共享，提高查找效率
 func NewCache(size int) *Cache {
-	// 定义 window 部分缓存所占百分比，这里定义为1%
-	const lruPct = 10
-	// 计算出来 widow 部分的容量
+	// 容量分配常量
+	const lruPct = 10 // Window LRU 占总容量的 10%
+
+	// 计算 Window LRU 的容量
 	lruSz := (lruPct * size) / 100
-
-	// 确保 lruSz 至少为1
 	if lruSz < 1 {
-		lruSz = 1
+		lruSz = 1 // 确保至少有 1 个条目
 	}
 
-	// 计算 LFU 部分的缓存容量
+	// 计算 Segmented LRU 的总容量
 	slruSz := int(float64(size) * ((100 - lruPct) / 100.0))
-
-	// 确保 slruSz 至少为1
 	if slruSz < 1 {
-		slruSz = 1
+		slruSz = 1 // 确保至少有 1 个条目
 	}
 
-	// LFU 分为两部分，stageOne 部分占比20%
+	// 计算 Segmented LRU 中试用区的容量（占 SLRU 的 20%）
 	slruO := int(0.2 * float64(slruSz))
-
-	// 确保 stageOne 部分至少为1
 	if slruO < 1 {
-		slruO = 1
+		slruO = 1 // 确保至少有 1 个条目
 	}
 
-	// 初始化缓存数据结构
+	// 初始化共享的数据存储结构
+	// 预分配容量以减少哈希表的重新分配
 	data := make(map[uint64]*list.Element, size)
 
-	// 创建并返回缓存实例
+	// 创建并返回完整的缓存实例
 	return &Cache{
-		lru:  newWindowLRU(lruSz, data),
+		// Window LRU：第一级缓存，捕获短期热点
+		lru: newWindowLRU(lruSz, data),
+
+		// Segmented LRU：第二级缓存，保护长期热点
+		// slruO: 试用区容量，slruSz-slruO: 保护区容量
 		slru: newSLRU(data, slruO, slruSz-slruO),
-		door: newFilter(size, 0.01), // 布隆过滤器设置误差率为0.01
-		c:    newCmSketch(int64(size)),
-		data: data, // 共用同一个 map 存储数据
+
+		// 布隆过滤器：准入控制，1% 假阳性率
+		door: newFilter(size, 0.01),
+
+		// Count-Min Sketch：频率估计器
+		c: newCmSketch(int64(size)),
+
+		// 共享数据存储：所有层级共享同一个哈希表
+		data: data,
 	}
 }
 
+// Set 向缓存中插入一个键值对。
+// 这是缓存的主要写入接口，支持并发安全的数据插入。
+//
+// 参数说明：
+// key: 要插入的键，支持任意类型
+// value: 要插入的值，支持任意类型
+//
+// 返回值：
+// true: 插入成功
+// false: 插入失败（通常由于准入控制拒绝）
+//
+// 并发安全：
+// 使用写锁保护整个插入过程，确保数据一致性。
+//
+// 插入策略：
+// 1. 所有新数据首先进入 Window LRU
+// 2. 通过准入控制决定是否接受数据
+// 3. 可能触发缓存层级间的数据迁移
 func (c *Cache) Set(key interface{}, value interface{}) bool {
 	c.m.Lock()
 	defer c.m.Unlock()
 	return c.set(key, value)
 }
 
+// set 是内部的插入实现，假设调用者已经持有锁。
+// 实现了完整的多层级缓存插入逻辑。
+//
+// 参数说明：
+// key: 要插入的键
+// value: 要插入的值
+//
+// 返回值：
+// true: 插入成功，false: 插入失败
+//
+// 插入流程：
+// 1. 计算键的哈希值和冲突检测哈希
+// 2. 创建存储项，初始阶段为 Window LRU
+// 3. 执行准入控制和层级管理
+// 4. 更新频率统计和布隆过滤器
 func (c *Cache) set(key, value interface{}) bool {
-	// keyHash 用来快速定位，conflict 用来判断冲突
+	// 计算键的哈希值
+	// keyHash: 主哈希值，用于快速定位
+	// conflictHash: 冲突检测哈希，用于处理哈希冲突
 	keyHash, conflictHash := c.keyToHash(key)
 
-	// 刚放进去的缓存都先放到 window lru 中，所以 stage = 0
+	// 创建存储项，所有新数据都从 Window LRU 开始
 	i := storeItem{
-		stage:    0,
-		key:      keyHash,
-		conflict: conflictHash,
+		stage:    0,            // 阶段 0 表示 Window LRU
+		key:      keyHash,      // 主键哈希值
+		conflict: conflictHash, // 冲突检测哈希值
 		value:    value,
 	}
 
