@@ -110,9 +110,9 @@ func CreateMmapFile(fd *os.File, sz int, writable bool) (*MmapFile, error) {
 	}
 	fileSize := fileInfo.Size()
 
-	// 如果指定了大小且文件为空，则截断文件到指定大小
+	// 如果指定了大小且文件大小不足，则截断文件到指定大小
 	// 在 macOS 上，这会触发 APFS 的空间预分配机制
-	if sz > 0 && fileSize == 0 {
+	if sz > 0 && fileSize < int64(sz) {
 		if err := fd.Truncate(int64(sz)); err != nil {
 			return nil, errors.Wrapf(err, "截断文件时出错")
 		}

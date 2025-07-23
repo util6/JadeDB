@@ -58,6 +58,11 @@ var (
 	ErrTaskQueueFull = errors.New("Task queue is full")
 	ErrTaskTimeout   = errors.New("Task execution timeout")
 	ErrTaskPanic     = errors.New("Task execution panic")
+
+	// B+树相关错误
+	ErrInvalidOptions = errors.New("Invalid options")
+	ErrBufferPoolFull = errors.New("Buffer pool is full")
+	ErrPagePinned     = errors.New("Page is pinned and cannot be evicted")
 )
 
 // Panic 如果err 不为nil 则panicc

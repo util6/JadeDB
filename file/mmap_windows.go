@@ -27,8 +27,8 @@ func CreateMmapFile(fd *os.File, sz int, writable bool) (*MmapFile, error) {
 		return nil, errors.Wrapf(err, "无法获取文件 %s 的状态", filename)
 	}
 	fileSize := fileInfo.Size()
-	if sz > 0 && fileSize == 0 {
-		// 如果文件为空，将其截断为指定大小
+	if sz > 0 && fileSize < int64(sz) {
+		// 如果文件大小不足，将其截断为指定大小
 		if err := fd.Truncate(int64(sz)); err != nil {
 			return nil, errors.Wrapf(err, "截断文件时出错")
 		}
