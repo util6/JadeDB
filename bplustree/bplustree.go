@@ -42,12 +42,27 @@ import (
 	"github.com/util6/JadeDB/utils"
 )
 
+// IndexType 定义索引类型
+type IndexType string
+
+const (
+	// ClusteredIndex 聚簇索引：数据和索引存储在一起
+	ClusteredIndex IndexType = "clustered"
+	// SecondaryIndex 二级索引：索引指向主键或行ID
+	SecondaryIndex IndexType = "secondary"
+)
+
 // BTreeOptions 定义B+树的配置选项
 type BTreeOptions struct {
 	// 存储配置
 	WorkDir     string // 工作目录
 	PageSize    int    // 页面大小（默认16KB）
 	MaxFileSize int64  // 单个文件最大大小
+
+	// 索引配置
+	ClusteredIndex bool      // 是否使用聚簇索引（默认true）
+	PrimaryKey     string    // 主键字段名（聚簇索引使用）
+	IndexType      IndexType // 索引类型（clustered/secondary）
 
 	// 缓冲池配置
 	BufferPoolSize   int    // 缓冲池大小（页面数量）
@@ -86,6 +101,36 @@ const (
 	Serializable
 )
 
+// DefaultBTreeOptions 返回默认的B+树配置选项
+func DefaultBTreeOptions() *BTreeOptions {
+	return &BTreeOptions{
+		WorkDir:     "./btree_data",
+		PageSize:    16384,   // 16KB
+		MaxFileSize: 1 << 30, // 1GB
+
+		ClusteredIndex: true,
+		PrimaryKey:     "id",
+		IndexType:      ClusteredIndex,
+
+		BufferPoolSize:   1024, // 1024 pages
+		BufferPoolPolicy: "LRU",
+
+		IsolationLevel: RepeatableRead,
+		LockTimeout:    30 * time.Second,
+		DeadlockDetect: true,
+
+		EnableAdaptiveHash: true,
+		EnablePrefetch:     true,
+		PrefetchSize:       8,
+
+		WALBufferSize:      64 * 1024 * 1024, // 64MB
+		CheckpointInterval: 5 * time.Minute,
+
+		EnableCompression: false,
+		CompressionLevel:  1,
+	}
+}
+
 // BPlusTree 表示B+树存储引擎的核心实现
 // 这是JadeDB的第二个存储引擎，专门为读密集型工作负载优化
 type BPlusTree struct {
@@ -93,11 +138,13 @@ type BPlusTree struct {
 	lock sync.RWMutex // 保护B+树的全局结构
 
 	// 核心组件
-	pageManager     *PageManager     // 页面管理器
-	bufferPool      *BufferPool      // 缓冲池
-	walManager      *WALManager      // WAL管理器
-	recoveryManager *RecoveryManager // 恢复管理器
-	operations      *BTreeOperations // B+树操作接口
+	pageManager        *PageManager        // 页面管理器
+	bufferPool         *BufferPool         // 缓冲池
+	walManager         *WALManager         // WAL管理器
+	recoveryManager    *RecoveryManager    // 恢复管理器
+	lockManager        *PageLockManager    // 锁管理器
+	performanceMonitor *PerformanceMonitor // 性能监控器
+	operations         *BTreeOperations    // B+树操作接口
 
 	// 元数据管理
 	rootPageID atomic.Uint64 // 根页面ID
@@ -161,6 +208,12 @@ func NewBPlusTree(options *BTreeOptions) (*BPlusTree, error) {
 		options.BufferPoolSize = 1024 // 默认1024个页面
 	}
 
+	// 设置索引类型默认值
+	if options.IndexType == "" {
+		options.IndexType = ClusteredIndex
+		options.ClusteredIndex = true
+	}
+
 	// 创建B+树实例
 	btree := &BPlusTree{
 		options: options,
@@ -191,6 +244,13 @@ func NewBPlusTree(options *BTreeOptions) (*BPlusTree, error) {
 
 	// 设置WAL管理器到恢复管理器
 	btree.recoveryManager.SetWALManager(btree.walManager)
+
+	// 初始化页面锁管理器
+	btree.lockManager = NewPageLockManager(options)
+
+	// 初始化性能监控器
+	monitorOptions := DefaultMonitorOptions()
+	btree.performanceMonitor = NewPerformanceMonitor(monitorOptions)
 
 	// 初始化B+树操作接口
 	btree.operations = NewBTreeOperations(btree)
@@ -267,6 +327,21 @@ func (bt *BPlusTree) calculateTreeHeight() (int, error) {
 	// TODO: 实现树高度计算逻辑
 	// 从根页面开始，递归计算到叶子页面的深度
 	return 1, nil
+}
+
+// IsClusteredIndex 检查是否使用聚簇索引
+func (bt *BPlusTree) IsClusteredIndex() bool {
+	return bt.options.ClusteredIndex && bt.options.IndexType == ClusteredIndex
+}
+
+// GetIndexType 获取索引类型
+func (bt *BPlusTree) GetIndexType() IndexType {
+	return bt.options.IndexType
+}
+
+// GetPrimaryKey 获取主键字段名
+func (bt *BPlusTree) GetPrimaryKey() string {
+	return bt.options.PrimaryKey
 }
 
 // startBackgroundServices 启动后台服务
@@ -415,6 +490,14 @@ func (bt *BPlusTree) Close() error {
 	bt.closer.Close()
 
 	// 关闭各个组件
+	if err := bt.performanceMonitor.Close(); err != nil {
+		return err
+	}
+
+	if err := bt.lockManager.Close(); err != nil {
+		return err
+	}
+
 	if err := bt.walManager.Close(); err != nil {
 		return err
 	}

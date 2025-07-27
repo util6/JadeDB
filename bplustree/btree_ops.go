@@ -46,6 +46,21 @@ type SearchPath struct {
 	indexes []int   // 每个节点中的索引位置
 }
 
+// releasePath 释放路径中的所有页面
+// 这个方法确保所有通过GetPage获取的页面都被正确释放回缓冲池
+func (ops *BTreeOperations) releasePath(path *SearchPath) {
+	if path == nil {
+		return
+	}
+
+	// 释放路径中的所有页面
+	for _, node := range path.nodes {
+		if node != nil && node.page != nil {
+			ops.bufferPool.PutPage(node.page)
+		}
+	}
+}
+
 // NewBTreeOperations 创建B+树操作实例
 func NewBTreeOperations(btree *BPlusTree) *BTreeOperations {
 	return &BTreeOperations{
@@ -73,6 +88,9 @@ func (ops *BTreeOperations) Insert(key []byte, value []byte) error {
 	if err != nil {
 		return err
 	}
+
+	// 确保在函数结束时释放所有页面
+	defer ops.releasePath(path)
 
 	// 在叶子节点插入
 	leafNode := path.nodes[len(path.nodes)-1]
@@ -107,6 +125,9 @@ func (ops *BTreeOperations) Search(key []byte) ([]byte, error) {
 		return nil, err
 	}
 
+	// 确保释放叶子节点页面
+	defer ops.bufferPool.PutPage(leafNode.page)
+
 	// 在叶子节点中搜索
 	record, _, err := leafNode.searchRecord(key)
 	if err != nil {
@@ -127,6 +148,9 @@ func (ops *BTreeOperations) Delete(key []byte) error {
 	if err != nil {
 		return err
 	}
+
+	// 确保在函数结束时释放所有页面
+	defer ops.releasePath(path)
 
 	// 在叶子节点中查找并删除
 	leafNode := path.nodes[len(path.nodes)-1]
@@ -256,7 +280,7 @@ func (ops *BTreeOperations) findLeafNode(key []byte) (*Node, error) {
 			return nil, err
 		}
 
-		// 如果是叶子节点，返回
+		// 如果是叶子节点，返回（调用者负责释放页面）
 		if node.IsLeaf() {
 			return node, nil
 		}
@@ -264,6 +288,7 @@ func (ops *BTreeOperations) findLeafNode(key []byte) (*Node, error) {
 		// 内部节点，查找子节点
 		_, childPageID, err := ops.findChildNode(node, key)
 		if err != nil {
+			ops.bufferPool.PutPage(page)
 			return nil, err
 		}
 
@@ -281,18 +306,42 @@ func (ops *BTreeOperations) findChildNode(node *Node, key []byte) (int, uint64, 
 
 	recordCount := node.GetRecordCount()
 	if recordCount == 0 {
-		return 0, 0, fmt.Errorf("empty internal node")
+		// 添加调试信息
+		return 0, 0, fmt.Errorf("empty internal node: pageID=%d, isRoot=%v, level=%d",
+			node.GetPageID(), node.IsRoot(), node.GetLevel())
 	}
 
 	// 在内部节点中查找合适的子节点
+	// 第一个记录（索引0）使用空键，对应最左边的子节点
 	for i := uint16(0); i < recordCount; i++ {
 		record, err := node.getRecord(i)
 		if err != nil {
 			return 0, 0, err
 		}
 
-		// 比较键
-		if bytes.Compare(key, record.Key) <= 0 {
+		// 如果是第一个记录（空键），检查是否应该使用这个子节点
+		if i == 0 && len(record.Key) == 0 {
+			// 如果只有一个记录，或者键小于下一个记录的键，使用第一个子节点
+			if recordCount == 1 {
+				childPageID := binary.LittleEndian.Uint64(record.Value)
+				return int(i), childPageID, nil
+			}
+
+			// 检查下一个记录
+			nextRecord, err := node.getRecord(1)
+			if err != nil {
+				return 0, 0, err
+			}
+
+			if bytes.Compare(key, nextRecord.Key) < 0 {
+				childPageID := binary.LittleEndian.Uint64(record.Value)
+				return int(i), childPageID, nil
+			}
+			continue
+		}
+
+		// 比较键（非空键）
+		if len(record.Key) > 0 && bytes.Compare(key, record.Key) <= 0 {
 			// 解析子页面ID
 			if len(record.Value) != 8 {
 				return 0, 0, fmt.Errorf("invalid child page ID")
@@ -308,6 +357,9 @@ func (ops *BTreeOperations) findChildNode(node *Node, key []byte) (int, uint64, 
 		return 0, 0, err
 	}
 
+	if len(lastRecord.Value) != 8 {
+		return 0, 0, fmt.Errorf("invalid child page ID")
+	}
 	childPageID := binary.LittleEndian.Uint64(lastRecord.Value)
 	return int(recordCount - 1), childPageID, nil
 }
@@ -517,8 +569,10 @@ func (ops *BTreeOperations) createNewInternalRoot(leftChild *Node, key []byte, r
 		return err
 	}
 
-	// 设置层级
-	if err := rootNode.SetLevel(leftChild.GetLevel() + 1); err != nil {
+	// 设置层级（内部节点的层级应该比子节点高1）
+	childLevel := leftChild.GetLevel()
+	newLevel := childLevel + 1
+	if err := rootNode.SetLevel(newLevel); err != nil {
 		return err
 	}
 
@@ -526,19 +580,34 @@ func (ops *BTreeOperations) createNewInternalRoot(leftChild *Node, key []byte, r
 	leftPageIDBytes := make([]byte, 8)
 	binary.LittleEndian.PutUint64(leftPageIDBytes, leftChild.GetPageID())
 	if err := rootNode.insertRecord([]byte{}, leftPageIDBytes, IndexRecord); err != nil {
-		return err
+		return fmt.Errorf("failed to insert left child record: %v", err)
 	}
 
 	// 插入分裂键和指向右子节点的记录
 	rightPageIDBytes := make([]byte, 8)
 	binary.LittleEndian.PutUint64(rightPageIDBytes, rightPageID)
 	if err := rootNode.insertRecord(key, rightPageIDBytes, IndexRecord); err != nil {
-		return err
+		return fmt.Errorf("failed to insert right child record: %v", err)
+	}
+
+	// 验证新根节点不为空
+	if rootNode.GetRecordCount() == 0 {
+		return fmt.Errorf("new root node is empty after creation")
+	}
+
+	// 写入根节点页面到磁盘
+	if err := ops.pageManager.WritePage(rootPage); err != nil {
+		return fmt.Errorf("failed to write root page: %v", err)
 	}
 
 	// 更新子节点的根标志
 	if err := leftChild.SetRoot(false); err != nil {
 		return err
+	}
+
+	// 写入左子节点页面
+	if err := ops.pageManager.WritePage(leftChild.page); err != nil {
+		return fmt.Errorf("failed to write left child page: %v", err)
 	}
 
 	// 更新B+树信息
@@ -552,6 +621,18 @@ func (ops *BTreeOperations) createNewInternalRoot(leftChild *Node, key []byte, r
 // splitInternalNode 分裂内部节点
 func (ops *BTreeOperations) splitInternalNode(path *SearchPath) error {
 	internalNode := path.nodes[len(path.nodes)-1]
+
+	// 获取所有记录
+	records, err := internalNode.getAllRecords()
+	if err != nil {
+		return err
+	}
+
+	// 确保至少有2个记录才能分裂
+	if len(records) < 2 {
+		return fmt.Errorf("internal node has too few records to split: pageID=%d, records=%d",
+			internalNode.GetPageID(), len(records))
+	}
 
 	// 分配新的右节点页面
 	rightPage, err := ops.pageManager.AllocatePage(InternalPage)
@@ -569,14 +650,11 @@ func (ops *BTreeOperations) splitInternalNode(path *SearchPath) error {
 		return err
 	}
 
-	// 获取所有记录
-	records, err := internalNode.getAllRecords()
-	if err != nil {
-		return err
-	}
-
-	// 计算分裂点
+	// 计算分裂点，确保左节点至少有1个记录
 	splitPoint := len(records) / 2
+	if splitPoint == 0 {
+		splitPoint = 1
+	}
 	splitKey := records[splitPoint].Key
 
 	// 清空左节点
@@ -589,16 +667,47 @@ func (ops *BTreeOperations) splitInternalNode(path *SearchPath) error {
 	for i := 0; i < splitPoint; i++ {
 		record := records[i]
 		if err := internalNode.insertRecord(record.Key, record.Value, record.RecordType); err != nil {
-			return err
+			return fmt.Errorf("failed to insert record %d into left node: %v", i, err)
 		}
 	}
 
-	// 右半部分（不包括分裂键）
+	// 右半部分需要包含分裂键对应的子指针
+	// 首先插入一个空键记录，指向分裂键对应的子节点
+	splitRecord := records[splitPoint]
+	if err := rightNode.insertRecord([]byte{}, splitRecord.Value, IndexRecord); err != nil {
+		return fmt.Errorf("failed to insert split record into right node: %v", err)
+	}
+
+	// 然后插入分裂键右边的记录
 	for i := splitPoint + 1; i < len(records); i++ {
 		record := records[i]
 		if err := rightNode.insertRecord(record.Key, record.Value, record.RecordType); err != nil {
-			return err
+			return fmt.Errorf("failed to insert record %d into right node: %v", i, err)
 		}
+	}
+
+	// 验证分裂后的节点不为空
+	if internalNode.GetRecordCount() == 0 {
+		return fmt.Errorf("left node became empty after split: pageID=%d", internalNode.GetPageID())
+	}
+	if rightNode.GetRecordCount() == 0 {
+		return fmt.Errorf("right node became empty after split: pageID=%d", rightNode.GetPageID())
+	}
+
+	// 写入节点头部
+	if err := internalNode.writeNodeHeader(); err != nil {
+		return fmt.Errorf("failed to write left node header: %v", err)
+	}
+	if err := rightNode.writeNodeHeader(); err != nil {
+		return fmt.Errorf("failed to write right node header: %v", err)
+	}
+
+	// 写入页面到磁盘
+	if err := ops.pageManager.WritePage(internalNode.page); err != nil {
+		return fmt.Errorf("failed to write left node page: %v", err)
+	}
+	if err := ops.pageManager.WritePage(rightNode.page); err != nil {
+		return fmt.Errorf("failed to write right node page: %v", err)
 	}
 
 	// 向父节点插入分裂键
@@ -672,12 +781,298 @@ func (ops *BTreeOperations) handleEmptyRoot(root *Node) error {
 
 // tryBorrowFromSibling 尝试从兄弟节点借用记录
 func (ops *BTreeOperations) tryBorrowFromSibling(path *SearchPath) error {
-	// 简化实现：暂时不支持借用，直接返回错误
-	return fmt.Errorf("borrowing not implemented")
+	if len(path.nodes) < 2 {
+		return fmt.Errorf("no parent node")
+	}
+
+	node := path.nodes[len(path.nodes)-1]
+	parent := path.nodes[len(path.nodes)-2]
+	nodeIndex := path.indexes[len(path.indexes)-1]
+
+	// 尝试从右兄弟借用
+	if nodeIndex < int(parent.GetRecordCount())-1 {
+		if err := ops.borrowFromRightSibling(node, parent, nodeIndex); err == nil {
+			return nil
+		}
+	}
+
+	// 尝试从左兄弟借用
+	if nodeIndex > 0 {
+		if err := ops.borrowFromLeftSibling(node, parent, nodeIndex); err == nil {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("cannot borrow from siblings")
+}
+
+// borrowFromRightSibling 从右兄弟节点借用记录
+func (ops *BTreeOperations) borrowFromRightSibling(node *Node, parent *Node, nodeIndex int) error {
+	// 获取右兄弟节点
+	rightSiblingRecord, err := parent.getRecord(uint16(nodeIndex + 1))
+	if err != nil {
+		return err
+	}
+
+	rightSiblingPageID := binary.LittleEndian.Uint64(rightSiblingRecord.Value)
+	rightSiblingPage, err := ops.bufferPool.GetPage(rightSiblingPageID)
+	if err != nil {
+		return err
+	}
+	defer ops.bufferPool.PutPage(rightSiblingPage)
+
+	rightSibling, err := LoadNode(rightSiblingPage)
+	if err != nil {
+		return err
+	}
+
+	// 检查右兄弟是否有足够的记录可以借用
+	if rightSibling.GetRecordCount() <= 1 {
+		return fmt.Errorf("right sibling has insufficient records")
+	}
+
+	// 从右兄弟借用第一条记录
+	firstRecord, err := rightSibling.getRecord(0)
+	if err != nil {
+		return err
+	}
+
+	// 将记录添加到当前节点
+	if err := node.insertRecord(firstRecord.Key, firstRecord.Value, firstRecord.RecordType); err != nil {
+		return err
+	}
+
+	// 从右兄弟删除第一条记录
+	if err := rightSibling.deleteRecord(0); err != nil {
+		return err
+	}
+
+	// 如果是叶子节点，更新父节点中的分隔键
+	if node.IsLeaf() {
+		newFirstRecord, err := rightSibling.getRecord(0)
+		if err != nil {
+			return err
+		}
+
+		// 更新父节点中指向右兄弟的键
+		updatedRecord := &Record{
+			Key:        newFirstRecord.Key,
+			Value:      rightSiblingRecord.Value,
+			RecordType: rightSiblingRecord.RecordType,
+		}
+		if err := parent.updateRecord(uint16(nodeIndex+1), rightSiblingRecord, updatedRecord.Value); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// borrowFromLeftSibling 从左兄弟节点借用记录
+func (ops *BTreeOperations) borrowFromLeftSibling(node *Node, parent *Node, nodeIndex int) error {
+	// 获取左兄弟节点
+	leftSiblingRecord, err := parent.getRecord(uint16(nodeIndex - 1))
+	if err != nil {
+		return err
+	}
+
+	leftSiblingPageID := binary.LittleEndian.Uint64(leftSiblingRecord.Value)
+	leftSiblingPage, err := ops.bufferPool.GetPage(leftSiblingPageID)
+	if err != nil {
+		return err
+	}
+	defer ops.bufferPool.PutPage(leftSiblingPage)
+
+	leftSibling, err := LoadNode(leftSiblingPage)
+	if err != nil {
+		return err
+	}
+
+	// 检查左兄弟是否有足够的记录可以借用
+	if leftSibling.GetRecordCount() <= 1 {
+		return fmt.Errorf("left sibling has insufficient records")
+	}
+
+	// 从左兄弟借用最后一条记录
+	lastIndex := leftSibling.GetRecordCount() - 1
+	lastRecord, err := leftSibling.getRecord(lastIndex)
+	if err != nil {
+		return err
+	}
+
+	// 将记录添加到当前节点的开头
+	if err := node.insertRecord(lastRecord.Key, lastRecord.Value, lastRecord.RecordType); err != nil {
+		return err
+	}
+
+	// 从左兄弟删除最后一条记录
+	if err := leftSibling.deleteRecord(lastIndex); err != nil {
+		return err
+	}
+
+	// 如果是叶子节点，更新父节点中的分隔键
+	if node.IsLeaf() {
+		firstRecord, err := node.getRecord(0)
+		if err != nil {
+			return err
+		}
+
+		// 更新父节点中指向当前节点的键
+		currentRecord, err := parent.getRecord(uint16(nodeIndex))
+		if err != nil {
+			return err
+		}
+
+		updatedRecord := &Record{
+			Key:        firstRecord.Key,
+			Value:      currentRecord.Value,
+			RecordType: currentRecord.RecordType,
+		}
+		if err := parent.updateRecord(uint16(nodeIndex), currentRecord, updatedRecord.Value); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // mergeWithSibling 与兄弟节点合并
 func (ops *BTreeOperations) mergeWithSibling(path *SearchPath) error {
-	// 简化实现：暂时不支持合并，直接返回错误
-	return fmt.Errorf("merging not implemented")
+	if len(path.nodes) < 2 {
+		return fmt.Errorf("no parent node")
+	}
+
+	node := path.nodes[len(path.nodes)-1]
+	parent := path.nodes[len(path.nodes)-2]
+	nodeIndex := path.indexes[len(path.indexes)-1]
+
+	// 优先与右兄弟合并
+	if nodeIndex < int(parent.GetRecordCount())-1 {
+		return ops.mergeWithRightSibling(node, parent, nodeIndex)
+	}
+
+	// 与左兄弟合并
+	if nodeIndex > 0 {
+		return ops.mergeWithLeftSibling(node, parent, nodeIndex)
+	}
+
+	return fmt.Errorf("no sibling to merge with")
+}
+
+// mergeWithRightSibling 与右兄弟节点合并
+func (ops *BTreeOperations) mergeWithRightSibling(node *Node, parent *Node, nodeIndex int) error {
+	// 获取右兄弟节点
+	rightSiblingRecord, err := parent.getRecord(uint16(nodeIndex + 1))
+	if err != nil {
+		return err
+	}
+
+	rightSiblingPageID := binary.LittleEndian.Uint64(rightSiblingRecord.Value)
+	rightSiblingPage, err := ops.bufferPool.GetPage(rightSiblingPageID)
+	if err != nil {
+		return err
+	}
+	defer ops.bufferPool.PutPage(rightSiblingPage)
+
+	rightSibling, err := LoadNode(rightSiblingPage)
+	if err != nil {
+		return err
+	}
+
+	// 将右兄弟的所有记录移动到当前节点
+	rightRecords, err := rightSibling.getAllRecords()
+	if err != nil {
+		return err
+	}
+
+	for _, record := range rightRecords {
+		if err := node.insertRecord(record.Key, record.Value, record.RecordType); err != nil {
+			return err
+		}
+	}
+
+	// 如果是叶子节点，更新链表指针
+	if node.IsLeaf() {
+		node.header.RightSibling = rightSibling.header.RightSibling
+		if rightSibling.header.RightSibling != 0 {
+			// 更新右兄弟的右兄弟的左指针
+			rightRightPage, err := ops.bufferPool.GetPage(rightSibling.header.RightSibling)
+			if err == nil {
+				rightRightNode, err := LoadNode(rightRightPage)
+				if err == nil {
+					rightRightNode.header.LeftSibling = node.GetPageID()
+				}
+				ops.bufferPool.PutPage(rightRightPage)
+			}
+		}
+	}
+
+	// 从父节点删除指向右兄弟的记录
+	if err := parent.deleteRecord(uint16(nodeIndex + 1)); err != nil {
+		return err
+	}
+
+	// 释放右兄弟页面
+	ops.pageManager.FreePage(rightSiblingPageID)
+
+	return nil
+}
+
+// mergeWithLeftSibling 与左兄弟节点合并
+func (ops *BTreeOperations) mergeWithLeftSibling(node *Node, parent *Node, nodeIndex int) error {
+	// 获取左兄弟节点
+	leftSiblingRecord, err := parent.getRecord(uint16(nodeIndex - 1))
+	if err != nil {
+		return err
+	}
+
+	leftSiblingPageID := binary.LittleEndian.Uint64(leftSiblingRecord.Value)
+	leftSiblingPage, err := ops.bufferPool.GetPage(leftSiblingPageID)
+	if err != nil {
+		return err
+	}
+	defer ops.bufferPool.PutPage(leftSiblingPage)
+
+	leftSibling, err := LoadNode(leftSiblingPage)
+	if err != nil {
+		return err
+	}
+
+	// 将当前节点的所有记录移动到左兄弟
+	currentRecords, err := node.getAllRecords()
+	if err != nil {
+		return err
+	}
+
+	for _, record := range currentRecords {
+		if err := leftSibling.insertRecord(record.Key, record.Value, record.RecordType); err != nil {
+			return err
+		}
+	}
+
+	// 如果是叶子节点，更新链表指针
+	if node.IsLeaf() {
+		leftSibling.header.RightSibling = node.header.RightSibling
+		if node.header.RightSibling != 0 {
+			// 更新右兄弟的左指针
+			rightPage, err := ops.bufferPool.GetPage(node.header.RightSibling)
+			if err == nil {
+				rightNode, err := LoadNode(rightPage)
+				if err == nil {
+					rightNode.header.LeftSibling = leftSiblingPageID
+				}
+				ops.bufferPool.PutPage(rightPage)
+			}
+		}
+	}
+
+	// 从父节点删除指向当前节点的记录
+	if err := parent.deleteRecord(uint16(nodeIndex)); err != nil {
+		return err
+	}
+
+	// 释放当前节点页面
+	ops.pageManager.FreePage(node.GetPageID())
+
+	return nil
 }

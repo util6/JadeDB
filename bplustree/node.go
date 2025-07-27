@@ -170,6 +170,28 @@ func LoadNode(page *Page) (*Node, error) {
 		return nil, err
 	}
 
+	// 验证页面类型和节点类型的一致性
+	var expectedNodeType NodeType
+	switch page.Type {
+	case LeafPage, RootPage:
+		// 根页面可能是叶子节点（当树只有一层时）
+		expectedNodeType = LeafNodeType
+	case InternalPage:
+		expectedNodeType = InternalNodeType
+	default:
+		// 对于其他页面类型（如MetaPage、FreelistPage等），不进行节点类型检查
+		// 这些页面不是B+树节点
+		return nil, fmt.Errorf("invalid page type for B+tree node: %d", page.Type)
+	}
+
+	// 只有当页面类型明确是B+树节点时才检查节点类型
+	if page.Type == InternalPage || page.Type == LeafPage {
+		if node.header.NodeType != expectedNodeType {
+			return nil, fmt.Errorf("page type mismatch: page type %d, node type %d, expected node type %d",
+				page.Type, node.header.NodeType, expectedNodeType)
+		}
+	}
+
 	return node, nil
 }
 
@@ -371,7 +393,13 @@ func deserializeRecord(data []byte) (*Record, error) {
 
 // insertRecord 在节点中插入记录
 func (n *Node) insertRecord(key []byte, value []byte, recordType RecordType) error {
-	// 创建记录
+	// 首先检查键是否已存在
+	if existingRecord, index, err := n.searchRecord(key); err == nil {
+		// 键已存在，更新现有记录
+		return n.updateRecord(uint16(index), existingRecord, value)
+	}
+
+	// 创建新记录
 	record := &Record{
 		RecordType: recordType,
 		KeySize:    uint16(len(key)),
@@ -551,6 +579,44 @@ func (n *Node) searchRecord(key []byte) (*Record, int, error) {
 	}
 
 	return nil, -1, fmt.Errorf("record not found")
+}
+
+// updateRecord 更新指定索引的记录值
+func (n *Node) updateRecord(index uint16, existingRecord *Record, newValue []byte) error {
+	if index >= n.header.SlotCount {
+		return fmt.Errorf("record index %d out of range", index)
+	}
+
+	// 如果新值大小与旧值相同，可以就地更新
+	if len(newValue) == len(existingRecord.Value) {
+		// 获取记录偏移量
+		recordOffset, err := n.getSlot(index)
+		if err != nil {
+			return err
+		}
+
+		// 计算值的偏移量（跳过记录头部和键）
+		valueOffset := recordOffset + 8 + uint16(len(existingRecord.Key))
+
+		// 直接更新值
+		copy(n.page.Data[valueOffset:valueOffset+uint16(len(newValue))], newValue)
+		n.page.Dirty = true
+		n.page.UpdateChecksum()
+		return nil
+	}
+
+	// 值大小不同，需要删除旧记录并插入新记录
+	// 先保存键
+	key := make([]byte, len(existingRecord.Key))
+	copy(key, existingRecord.Key)
+
+	// 删除旧记录
+	if err := n.deleteRecord(index); err != nil {
+		return err
+	}
+
+	// 插入新记录（递归调用，但此时键不存在，不会再次更新）
+	return n.insertRecord(key, newValue, existingRecord.RecordType)
 }
 
 // deleteRecord 删除指定索引的记录
