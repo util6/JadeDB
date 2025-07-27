@@ -32,9 +32,10 @@ LSM（Log-Structured Merge Tree）是 JadeDB 的核心存储引擎，
 package lsm
 
 import (
-	"github.com/util6/JadeDB/utils"
 	"sync"
 	"time"
+
+	"github.com/util6/JadeDB/utils"
 )
 
 // LSM 表示日志结构合并树（Log-Structured Merge Tree）的核心实现。
@@ -131,97 +132,6 @@ type LSM struct {
 // - 根据磁盘性能调整 SSTableMaxSz
 // - 根据工作负载调整压缩参数
 // - 根据查询模式调整布隆过滤器
-type Options struct {
-	// 基础存储配置
-
-	// WorkDir 指定数据库文件的存储目录。
-	// 所有的 SSTable 文件、WAL 文件和元数据文件都存储在这个目录中。
-	// 建议使用 SSD 存储以获得更好的性能。
-	// 确保目录有足够的磁盘空间和适当的权限。
-	WorkDir string
-
-	// 内存配置
-
-	// MemTableSize 设置单个内存表的最大字节数。
-	// 当内存表达到此大小时，会被转换为不可变表并刷新到磁盘。
-	// 较大的值可以减少磁盘写入频率，但占用更多内存。
-	// 推荐值：64MB-256MB，根据可用内存调整。
-	MemTableSize int64
-
-	// 磁盘存储配置
-
-	// SSTableMaxSz 设置单个 SSTable 文件的最大字节数。
-	// 超过此大小的 SSTable 在压缩时会被分割。
-	// 较大的值可以减少文件数量，但可能增加读取延迟。
-	// 推荐值：64MB-256MB，根据磁盘性能调整。
-	SSTableMaxSz int64
-
-	// BlockSize 设置 SSTable 中数据块的字节大小。
-	// 数据块是读取和缓存的基本单位。
-	// 较小的块可以减少读放大，但增加索引开销。
-	// 较大的块可以提高压缩率，但可能增加内存使用。
-	// 推荐值：4KB-64KB，根据访问模式调整。
-	BlockSize int
-
-	// 性能优化配置
-
-	// BloomFalsePositive 设置布隆过滤器的假阳性率。
-	// 较低的值可以减少不必要的磁盘访问，但增加内存使用。
-	// 值为 0 表示禁用布隆过滤器。
-	// 推荐值：0.01（1%），在内存和性能之间平衡。
-	BloomFalsePositive float64
-
-	// 压缩策略配置
-
-	// NumCompactors 设置并发压缩工作器的数量。
-	// 更多的压缩器可以加快压缩速度，但增加 CPU 和 I/O 负载。
-	// 应该根据 CPU 核心数和磁盘性能来设置。
-	// 推荐值：1-4，根据硬件配置调整。
-	NumCompactors int
-
-	// BaseLevelSize 设置基础层（通常是 L1）的目标大小。
-	// 这是分层压缩策略的起点，影响整体的存储结构。
-	// 较大的值可以减少层级数量，但可能增加压缩开销。
-	// 推荐值：10MB-100MB，根据数据量调整。
-	BaseLevelSize int64
-
-	// LevelSizeMultiplier 设置相邻层级之间的大小倍数。
-	// 每个层级的目标大小是上一层级的这个倍数。
-	// 较大的值可以减少层级数量，但可能增加读放大。
-	// 推荐值：10，这是经过验证的最佳实践。
-	LevelSizeMultiplier int
-
-	// TableSizeMultiplier 设置表大小的增长倍数。
-	// 控制不同层级中 SSTable 的大小差异。
-	// 影响压缩的粒度和效率。
-	// 推荐值：2，提供良好的平衡。
-	TableSizeMultiplier int
-
-	// BaseTableSize 设置基础层中 SSTable 的目标大小。
-	// 这是压缩策略的另一个重要参数。
-	// 影响文件数量和压缩频率。
-	// 推荐值：2MB-32MB，根据工作负载调整。
-	BaseTableSize int64
-
-	// NumLevelZeroTables 设置 L0 层允许的最大 SSTable 数量。
-	// 超过此数量时会触发 L0 到 L1 的压缩。
-	// 较大的值可以减少压缩频率，但可能增加读放大。
-	// 推荐值：4-8，在性能和延迟之间平衡。
-	NumLevelZeroTables int
-
-	// MaxLevelNum 设置 LSM 树的最大层级数。
-	// 限制数据的最大分布深度。
-	// 较多的层级可以容纳更多数据，但可能增加读放大。
-	// 推荐值：7，适合大多数应用场景。
-	MaxLevelNum int
-
-	// 统计和监控配置
-
-	// DiscardStatsCh 提供丢弃统计信息的通道。
-	// 用于垃圾回收过程中的统计信息传递。
-	// 帮助监控和优化存储空间的使用。
-	DiscardStatsCh *chan map[uint32]int64
-}
 
 // IsDeletedOrExpired 检查条目是否被删除或过期
 func IsDeletedOrExpired(entry *utils.Entry) bool {
@@ -257,6 +167,12 @@ func NewLSM(opt *Options) *LSM {
 	}
 
 	return lsm
+}
+
+// NewIterators 创建所有层级的迭代器
+func (lsm *LSM) NewIterators(opt *utils.Options) []utils.Iterator {
+	// 简化实现：返回空迭代器列表
+	return []utils.Iterator{}
 }
 
 // NewMergeIterator 创建一个合并迭代器

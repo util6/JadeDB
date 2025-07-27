@@ -34,9 +34,11 @@ JadeDB 统计信息模块
 - 可扩展：支持添加新的统计指标
 */
 
-package JadeDB
+package lsm
 
 import (
+	"time"
+
 	"github.com/util6/JadeDB/utils"
 )
 
@@ -131,7 +133,7 @@ func (s *Stats) StartStats() {
 		case <-s.closer.CloseSignal:
 			// 收到关闭信号，退出统计收集循环
 			return
-		default:
+		case <-time.After(time.Second):
 			// TODO: 在这里添加具体的统计收集逻辑
 			// 例如：
 			// - 收集内存使用情况

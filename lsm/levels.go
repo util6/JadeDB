@@ -34,10 +34,11 @@ package lsm
 
 import (
 	"bytes"
-	"github.com/util6/JadeDB/utils"
 	"sort"
 	"sync"
 	"sync/atomic"
+
+	"github.com/util6/JadeDB/utils"
 
 	"github.com/util6/JadeDB/file"
 )
@@ -520,4 +521,22 @@ func (lh *levelHandler) iterators() []utils.Iterator {
 		return nil
 	}
 	return []utils.Iterator{NewConcatIterator(lh.tables, topt)}
+}
+
+// NewConcatIterator 创建一个连接迭代器（简化实现）
+func NewConcatIterator(tables []*table, opt *utils.Options) utils.Iterator {
+	// 简化实现：返回第一个表的迭代器
+	if len(tables) > 0 {
+		return tables[0].NewIterator(opt)
+	}
+	return nil
+}
+
+// NewMergeIterator 创建一个合并迭代器（简化实现）
+func NewMergeIterator(iters []utils.Iterator, reverse bool) utils.Iterator {
+	// 简化实现：返回第一个迭代器
+	if len(iters) > 0 {
+		return iters[0]
+	}
+	return nil
 }

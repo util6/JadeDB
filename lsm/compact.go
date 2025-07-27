@@ -689,11 +689,10 @@ func (lm *levelManager) compactBuildTables(lev int, cd compactDef) ([]*table, fu
 	inflightBuilders := utils.NewThrottle(8 + len(cd.splits))
 	for _, kr := range cd.splits {
 		// Initiate Do here so we can register the goroutines for buildTables too.
-		if err := inflightBuilders.Do(); err != nil {
-			return nil, nil, fmt.Errorf("cannot start subcompaction: %+v", err)
-		}
+		done := inflightBuilders.Do()
 		// 开启一个协程去处理子压缩
 		go func(kr keyRange) {
+			defer done()
 			defer inflightBuilders.Done()
 			it := NewMergeIterator(newIterator(), false)
 			defer it.Close()

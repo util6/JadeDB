@@ -71,6 +71,15 @@ import (
 	"github.com/util6/JadeDB/utils"
 )
 
+// Item 简单的Item实现，用于迭代器
+type Item struct {
+	e *utils.Entry
+}
+
+func (item *Item) Entry() *utils.Entry {
+	return item.e
+}
+
 // tableBuilder 是 SSTable 文件的构建器。
 // 它负责将内存中的有序键值对数据转换为磁盘上的不可变 SSTable 文件。
 //
@@ -449,7 +458,6 @@ func (tb *tableBuilder) finishBlock() {
 	// 当前块已被序列化到内存，将其设置为nil，表示当前无活动块。
 	// 这是为了准备构建下一个块，确保状态清晰。
 	tb.curBlock = nil
-	return
 }
 
 // append appends to curBlock.data
