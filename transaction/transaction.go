@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/util6/JadeDB/storage"
+	"github.com/util6/JadeDB/txnwal"
 )
 
 // 前向声明，避免循环依赖
@@ -76,6 +77,9 @@ type TransactionManager struct {
 
 	// 默认存储引擎
 	defaultEngine storage.Engine
+
+	// 事务WAL管理器
+	txnWAL txnwal.TxnWALManager
 
 	// 事务跟踪
 	mu         sync.RWMutex
@@ -338,6 +342,15 @@ func NewTransactionManager(config *TransactionConfig) (*TransactionManager, erro
 		return nil, fmt.Errorf("failed to create MVCC manager: %w", err)
 	}
 
+	// 初始化事务WAL管理器
+	walOptions := txnwal.DefaultTxnWALOptions()
+	walOptions.Directory = "./txnwal"
+	tm.txnWAL, err = txnwal.NewFileTxnWALManager(walOptions)
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("failed to create transaction WAL: %w", err)
+	}
+
 	// 如果启用分布式，设置标志
 	if config.EnableDistributed {
 		tm.isDistributed = true
@@ -462,7 +475,7 @@ func (tm *TransactionManager) BeginTransactionWithEngine(engine storage.Engine, 
 	txnID := fmt.Sprintf("txn_%d_%d", time.Now().UnixNano(), tm.nextTxnID.Add(1))
 
 	// 使用存储适配器创建事务
-	return NewStorageTransactionAdapter(txnID, engine, tm, options)
+	return NewStorageTransactionAdapter(txnID, engine, tm, tm.txnWAL, options)
 }
 
 // GetMVCCManager 获取MVCC管理器

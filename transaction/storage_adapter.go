@@ -19,11 +19,13 @@
 package transaction
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/util6/JadeDB/storage"
+	"github.com/util6/JadeDB/txnwal"
 )
 
 // StorageTransactionAdapter 存储引擎事务适配器
@@ -35,6 +37,9 @@ type StorageTransactionAdapter struct {
 	commitTs uint64              // 事务提交时间戳
 	engine   storage.Engine      // 底层存储引擎
 	txnMgr   *TransactionManager // 事务管理器
+
+	// 事务WAL
+	txnWAL txnwal.TxnWALManager // 事务WAL管理器
 
 	// 事务配置
 	isolation IsolationLevel // 隔离级别
@@ -64,6 +69,7 @@ func NewStorageTransactionAdapter(
 	txnID string,
 	engine storage.Engine,
 	txnMgr *TransactionManager,
+	txnWAL txnwal.TxnWALManager,
 	options *TransactionOptions,
 ) (*StorageTransactionAdapter, error) {
 
@@ -75,11 +81,16 @@ func NewStorageTransactionAdapter(
 		return nil, fmt.Errorf("transaction manager cannot be nil")
 	}
 
+	if txnWAL == nil {
+		return nil, fmt.Errorf("transaction WAL cannot be nil")
+	}
+
 	adapter := &StorageTransactionAdapter{
 		txnID:       txnID,
 		startTs:     uint64(time.Now().UnixNano()),
 		engine:      engine,
 		txnMgr:      txnMgr,
+		txnWAL:      txnWAL,
 		isolation:   ReadCommitted, // 默认隔离级别
 		readOnly:    false,
 		timeout:     30 * time.Second, // 默认30秒超时
@@ -95,6 +106,11 @@ func NewStorageTransactionAdapter(
 		adapter.isolation = options.Isolation
 		adapter.timeout = options.Timeout
 		adapter.readOnly = options.ReadOnly
+	}
+
+	// 记录事务开始的WAL日志
+	if err := adapter.writeTransactionWAL(txnwal.LogTransactionBegin); err != nil {
+		return nil, fmt.Errorf("failed to write transaction begin WAL: %w", err)
 	}
 
 	return adapter, nil
@@ -160,6 +176,11 @@ func (adapter *StorageTransactionAdapter) Put(key, value []byte) error {
 	}
 
 	keyStr := string(key)
+
+	// 先记录WAL日志
+	if err := adapter.writeWALRecord(txnwal.LogDataInsert, key, value); err != nil {
+		return fmt.Errorf("failed to write WAL record: %w", err)
+	}
 
 	// 根据隔离级别决定处理方式
 	switch adapter.isolation {
@@ -234,6 +255,11 @@ func (adapter *StorageTransactionAdapter) Delete(key []byte) error {
 	}
 
 	keyStr := string(key)
+
+	// 先记录WAL日志
+	if err := adapter.writeWALRecord(txnwal.LogDataDelete, key, nil); err != nil {
+		return fmt.Errorf("failed to write WAL record: %w", err)
+	}
 
 	// 根据隔离级别决定处理方式
 	switch adapter.isolation {
@@ -327,6 +353,19 @@ func (adapter *StorageTransactionAdapter) Commit() error {
 		}
 	}
 
+	// 记录事务提交的WAL日志
+	if err := adapter.writeTransactionWAL(txnwal.LogTransactionCommit); err != nil {
+		adapter.state = TxnAborted
+		return fmt.Errorf("failed to write transaction commit WAL: %w", err)
+	}
+
+	// 强制刷新WAL确保持久性
+	ctx := context.Background()
+	if err := adapter.txnWAL.Flush(ctx); err != nil {
+		adapter.state = TxnAborted
+		return fmt.Errorf("failed to flush WAL: %w", err)
+	}
+
 	adapter.state = TxnCommitted
 	return nil
 }
@@ -335,6 +374,12 @@ func (adapter *StorageTransactionAdapter) Commit() error {
 func (adapter *StorageTransactionAdapter) Rollback() error {
 	adapter.mu.Lock()
 	defer adapter.mu.Unlock()
+
+	// 记录事务回滚的WAL日志
+	if err := adapter.writeTransactionWAL(txnwal.LogTransactionRollback); err != nil {
+		// 回滚失败也要继续清理，但记录错误
+		fmt.Printf("Warning: failed to write transaction rollback WAL: %v\n", err)
+	}
 
 	// 清空缓冲区
 	adapter.writeBuffer = make(map[string][]byte)
@@ -506,4 +551,59 @@ func (adapter *StorageTransactionAdapter) RollbackToSavepoint(name string) error
 // ReleaseSavepoint 释放保存点（暂不实现）
 func (adapter *StorageTransactionAdapter) ReleaseSavepoint(name string) error {
 	return fmt.Errorf("savepoints not supported in storage adapter")
+}
+
+// writeWALRecord 写入WAL日志记录
+func (adapter *StorageTransactionAdapter) writeWALRecord(recordType txnwal.TxnLogRecordType, key, value []byte) error {
+	// 构造WAL记录
+	record := &txnwal.TxnLogRecord{
+		Type:  recordType,
+		TxnID: adapter.txnID,
+		Data:  adapter.encodeKVData(key, value),
+	}
+
+	// 写入WAL
+	ctx := context.Background()
+	_, err := adapter.txnWAL.WriteRecord(ctx, record)
+	return err
+}
+
+// encodeKVData 编码键值数据
+func (adapter *StorageTransactionAdapter) encodeKVData(key, value []byte) []byte {
+	// 简单的编码格式：[keyLen(4字节)][key][valueLen(4字节)][value]
+	keyLen := len(key)
+	valueLen := len(value)
+	data := make([]byte, 4+keyLen+4+valueLen)
+
+	// 编码key长度和key
+	data[0] = byte(keyLen >> 24)
+	data[1] = byte(keyLen >> 16)
+	data[2] = byte(keyLen >> 8)
+	data[3] = byte(keyLen)
+	copy(data[4:], key)
+
+	// 编码value长度和value
+	offset := 4 + keyLen
+	data[offset] = byte(valueLen >> 24)
+	data[offset+1] = byte(valueLen >> 16)
+	data[offset+2] = byte(valueLen >> 8)
+	data[offset+3] = byte(valueLen)
+	copy(data[offset+4:], value)
+
+	return data
+}
+
+// writeTransactionWAL 写入事务相关的WAL记录
+func (adapter *StorageTransactionAdapter) writeTransactionWAL(recordType txnwal.TxnLogRecordType) error {
+	// 构造WAL记录
+	record := &txnwal.TxnLogRecord{
+		Type:  recordType,
+		TxnID: adapter.txnID,
+		Data:  []byte{}, // 事务记录不需要额外数据
+	}
+
+	// 写入WAL
+	ctx := context.Background()
+	_, err := adapter.txnWAL.WriteRecord(ctx, record)
+	return err
 }
