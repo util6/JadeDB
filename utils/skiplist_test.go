@@ -2,12 +2,13 @@ package utils
 
 import (
 	"fmt"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 /**
@@ -175,7 +176,7 @@ func TestSkipListIterator(t *testing.T) {
 	list.Add(entry2_new)
 	assert.Equal(t, entry2_new.Value, list.Search(entry2_new.Key).Value)
 
-	iter := list.newSkipListIterator()
+	iter := list.NewSkipListIterator()
 	for iter.Rewind(); iter.Valid(); iter.Next() {
 		fmt.Printf("iter key %s, valueIndex %s", iter.Item().Entry().Key, iter.Item().Entry().Value)
 	}

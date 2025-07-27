@@ -155,7 +155,7 @@ type valueLog struct {
 
 	// opt 包含值日志的配置选项。
 	// 包括文件大小限制、垃圾回收参数等。
-	opt Options
+	opt *Options
 
 	// 垃圾回收
 
@@ -1006,7 +1006,7 @@ func (db *DB) initVLog() {
 		},
 	}
 	vlog.db = db
-	vlog.opt = *db.opt
+	vlog.opt = db.opt
 	vlog.garbageCh = make(chan struct{}, 1)
 	if err := vlog.open(db, vp, db.replayFunction()); err != nil {
 		utils.Panic(err)
