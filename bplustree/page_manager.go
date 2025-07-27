@@ -302,6 +302,9 @@ func (pm *PageManager) AllocatePage(pageType PageType) (*Page, error) {
 	// 创建页面对象
 	page := NewPage(pageID, pageType)
 
+	// 注意：页面创建后需要由调用者负责写入磁盘
+	// 这样可以避免缓存一致性问题
+
 	return page, nil
 }
 
@@ -349,14 +352,21 @@ func (pm *PageManager) ReadPage(pageID uint64) (*Page, error) {
 
 	copy(page.Data, data)
 
+	// 从页面数据中读取页面头部信息
+	header := &PageHeader{}
+	page.readHeader(header)
+	page.Type = header.PageType
+
+	// 如果页面类型为0（可能是未初始化的页面），这可能是一个错误
+	if header.PageType == 0 && header.PageID == 0 {
+		// 这可能是一个未初始化的页面，返回错误
+		return nil, fmt.Errorf("page %d appears to be uninitialized (pageType=0, pageID=0)", pageID)
+	}
+
 	// 验证页面完整性 (暂时禁用用于调试)
 	// if !page.VerifyChecksum() {
 	//	return nil, fmt.Errorf("page %d checksum verification failed", pageID)
 	// }
-
-	// 从头部读取页面类型
-	header := page.GetHeader()
-	page.Type = header.PageType
 
 	return page, nil
 }
