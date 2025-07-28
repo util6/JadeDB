@@ -595,6 +595,10 @@ func (adapter *StorageTransactionAdapter) encodeKVData(key, value []byte) []byte
 
 // writeTransactionWAL 写入事务相关的WAL记录
 func (adapter *StorageTransactionAdapter) writeTransactionWAL(recordType txnwal.TxnLogRecordType) error {
+	if adapter.txnWAL == nil {
+		return fmt.Errorf("txnWAL is nil")
+	}
+
 	// 构造WAL记录
 	record := &txnwal.TxnLogRecord{
 		Type:  recordType,

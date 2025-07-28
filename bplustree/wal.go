@@ -33,6 +33,8 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -94,6 +96,7 @@ type WALManager struct {
 	// 文件管理
 	currentFile *file.MmapFile // 当前WAL文件
 	fileIndex   atomic.Uint64  // 文件索引
+	filePos     atomic.Int64   // 当前文件写入位置
 	fileMutex   sync.RWMutex   // 文件操作锁
 
 	// 日志序列号
@@ -167,9 +170,16 @@ func (wm *WALManager) initializeWAL() error {
 
 	// 找到最新的WAL文件
 	latestIndex := uint64(0)
-	for range matches {
+	for _, match := range matches {
 		// 解析文件索引
-		// TODO: 实现文件名解析逻辑
+		index, err := wm.parseWALFileName(match)
+		if err != nil {
+			continue // 跳过无效的文件名
+		}
+
+		if index > latestIndex {
+			latestIndex = index
+		}
 	}
 
 	// 打开最新的WAL文件
@@ -222,13 +232,48 @@ func (wm *WALManager) openWALFile(index uint64) error {
 	return wm.recoverLSN()
 }
 
+// parseWALFileName 解析WAL文件名，提取文件索引
+// WAL文件名格式：wal.000001.log
+func (wm *WALManager) parseWALFileName(filename string) (uint64, error) {
+	// 移除路径前缀，只保留文件名
+	baseName := filepath.Base(filename)
+
+	// 检查文件名格式
+	if !strings.HasPrefix(baseName, "wal.") || !strings.HasSuffix(baseName, ".log") {
+		return 0, fmt.Errorf("invalid WAL file name format: %s", baseName)
+	}
+
+	// 提取中间的数字部分
+	indexStr := baseName[4 : len(baseName)-4] // 去掉"wal."和".log"
+
+	// 解析为数字
+	index, err := strconv.ParseUint(indexStr, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse WAL file index: %w", err)
+	}
+
+	return index, nil
+}
+
 // recoverLSN 恢复LSN状态
 func (wm *WALManager) recoverLSN() error {
 	// 扫描WAL文件，找到最大的LSN
 	maxLSN := uint64(0)
 
-	// TODO: 实现WAL文件扫描逻辑
-	// 这里应该读取WAL文件中的所有记录，找到最大的LSN
+	// 实现WAL文件扫描逻辑
+	if wm.currentFile != nil {
+		// 获取文件大小
+		size := len(wm.currentFile.Data)
+
+		// 如果文件不为空，扫描记录
+		if size > 0 {
+			var err error
+			maxLSN, err = wm.scanWALFileForMaxLSN(wm.currentFile)
+			if err != nil {
+				return fmt.Errorf("failed to scan WAL file for max LSN: %w", err)
+			}
+		}
+	}
 
 	// 确保nextLSN至少从1开始
 	if maxLSN == 0 {
@@ -239,6 +284,47 @@ func (wm *WALManager) recoverLSN() error {
 	wm.flushedLSN.Store(maxLSN)
 
 	return nil
+}
+
+// scanWALFileForMaxLSN 扫描WAL文件，找到最大的LSN
+func (wm *WALManager) scanWALFileForMaxLSN(file *file.MmapFile) (uint64, error) {
+	maxLSN := uint64(0)
+
+	// 获取文件大小
+	size := int64(len(file.Data))
+	if size == 0 {
+		return 0, nil
+	}
+
+	offset := int64(0)
+
+	for offset < size {
+		// 检查是否有足够的空间读取记录头部
+		if offset+LogRecordHeaderSize > size {
+			break // 不完整的记录
+		}
+
+		// 直接从Data中读取记录头部
+		if int(offset+LogRecordHeaderSize) > len(file.Data) {
+			break // 防止越界
+		}
+
+		header := file.Data[offset : offset+LogRecordHeaderSize]
+
+		// 解析LSN（前8字节）
+		lsn := binary.LittleEndian.Uint64(header[0:8])
+		if lsn > maxLSN {
+			maxLSN = lsn
+		}
+
+		// 解析记录长度（第25-29字节）
+		length := binary.LittleEndian.Uint32(header[25:29])
+
+		// 移动到下一条记录
+		offset += LogRecordHeaderSize + int64(length)
+	}
+
+	return maxLSN, nil
 }
 
 // WriteRecord 写入日志记录
@@ -320,8 +406,35 @@ func (wm *WALManager) flushBufferUnsafe() error {
 
 	// 写入文件
 	if wm.currentFile != nil {
-		// TODO: 实现实际的文件写入逻辑
-		// 这里应该将缓冲区数据写入WAL文件
+		// 实现高效的文件写入逻辑
+		// 获取当前文件写入位置
+		currentPos := wm.filePos.Load()
+
+		// 检查文件是否需要轮转
+		if currentPos+int64(wm.bufferPos) > WALFileSize {
+			// 文件太大，需要轮转到新文件
+			if err := wm.rotateWALFile(); err != nil {
+				return fmt.Errorf("failed to rotate WAL file: %w", err)
+			}
+			currentPos = 0 // 新文件从0开始
+		}
+
+		// 将缓冲区数据写入文件
+		writeData := wm.buffer[:wm.bufferPos]
+		err := wm.currentFile.AppendBuffer(uint32(currentPos), writeData)
+		if err != nil {
+			return fmt.Errorf("failed to write to WAL file: %w", err)
+		}
+
+		// 更新文件位置
+		wm.filePos.Add(int64(wm.bufferPos))
+
+		// 更新已刷新的LSN
+		if wm.bufferPos > 0 {
+			// 计算最后一条记录的LSN
+			lastLSN := wm.nextLSN.Load() - 1
+			wm.flushedLSN.Store(lastLSN)
+		}
 	}
 
 	// 重置缓冲区
@@ -436,6 +549,39 @@ func (wm *WALManager) checkpointService() {
 			return
 		}
 	}
+}
+
+// rotateWALFile WAL文件轮转
+// 当当前WAL文件达到大小限制时，创建新的WAL文件
+func (wm *WALManager) rotateWALFile() error {
+	// 同步当前文件
+	if wm.currentFile != nil {
+		if err := wm.currentFile.Sync(); err != nil {
+			return fmt.Errorf("failed to sync current WAL file: %w", err)
+		}
+	}
+
+	// 获取下一个文件索引
+	nextIndex := wm.fileIndex.Load() + 1
+
+	// 关闭旧文件
+	if wm.currentFile != nil {
+		if err := wm.currentFile.Close(); err != nil {
+			// 记录错误但不返回，因为需要继续创建新文件
+			// 在生产环境中应该记录到日志
+		}
+	}
+
+	// 创建新的WAL文件
+	err := wm.createWALFile(nextIndex)
+	if err != nil {
+		return fmt.Errorf("failed to create new WAL file: %w", err)
+	}
+
+	// 更新文件位置
+	wm.filePos.Store(0) // 重置文件位置
+
+	return nil
 }
 
 // GetStats 获取WAL统计信息

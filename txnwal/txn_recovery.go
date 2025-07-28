@@ -64,6 +64,127 @@ type RecoveryCallbacks interface {
 	OnCheckpoint(lsn TxnLSN) error
 }
 
+// TransactionRecoveryCallbacks 事务恢复回调实现
+type TransactionRecoveryCallbacks struct {
+	// 存储引擎映射
+	engines map[string]interface{} // 可以存储不同类型的存储引擎
+
+	// 恢复统计
+	recoveredTxns int
+	recoveredOps  int
+	failedOps     int
+}
+
+// NewTransactionRecoveryCallbacks 创建事务恢复回调
+func NewTransactionRecoveryCallbacks() *TransactionRecoveryCallbacks {
+	return &TransactionRecoveryCallbacks{
+		engines: make(map[string]interface{}),
+	}
+}
+
+// AddEngine 添加存储引擎
+func (cb *TransactionRecoveryCallbacks) AddEngine(name string, engine interface{}) {
+	cb.engines[name] = engine
+}
+
+// OnTransactionBegin 处理事务开始
+func (cb *TransactionRecoveryCallbacks) OnTransactionBegin(txnID string, lsn TxnLSN) error {
+	fmt.Printf("恢复事务开始: %s (LSN: %d)\n", txnID, lsn)
+	cb.recoveredTxns++
+	return nil
+}
+
+// OnTransactionCommit 处理事务提交
+func (cb *TransactionRecoveryCallbacks) OnTransactionCommit(txnID string, lsn TxnLSN) error {
+	fmt.Printf("恢复事务提交: %s (LSN: %d)\n", txnID, lsn)
+	return nil
+}
+
+// OnTransactionRollback 处理事务回滚
+func (cb *TransactionRecoveryCallbacks) OnTransactionRollback(txnID string, lsn TxnLSN) error {
+	fmt.Printf("恢复事务回滚: %s (LSN: %d)\n", txnID, lsn)
+	return nil
+}
+
+// OnDataOperation 处理数据操作
+func (cb *TransactionRecoveryCallbacks) OnDataOperation(opType TxnLogRecordType, data []byte, lsn TxnLSN) error {
+	// 解码键值数据
+	key, value, err := cb.decodeKVData(data)
+	if err != nil {
+		cb.failedOps++
+		return fmt.Errorf("failed to decode KV data: %w", err)
+	}
+
+	switch opType {
+	case LogDataInsert:
+		fmt.Printf("恢复数据插入: key=%s, value=%s (LSN: %d)\n", string(key), string(value), lsn)
+		// 这里可以调用存储引擎的Put方法
+
+	case LogDataUpdate:
+		fmt.Printf("恢复数据更新: key=%s, value=%s (LSN: %d)\n", string(key), string(value), lsn)
+		// 这里可以调用存储引擎的Put方法
+
+	case LogDataDelete:
+		fmt.Printf("恢复数据删除: key=%s (LSN: %d)\n", string(key), lsn)
+		// 这里可以调用存储引擎的Delete方法
+	}
+
+	cb.recoveredOps++
+	return nil
+}
+
+// OnPageOperation 处理页面操作
+func (cb *TransactionRecoveryCallbacks) OnPageOperation(opType TxnLogRecordType, data []byte, lsn TxnLSN) error {
+	fmt.Printf("恢复页面操作: type=%d, data_len=%d (LSN: %d)\n", opType, len(data), lsn)
+	cb.recoveredOps++
+	return nil
+}
+
+// OnCheckpoint 处理检查点
+func (cb *TransactionRecoveryCallbacks) OnCheckpoint(lsn TxnLSN) error {
+	fmt.Printf("恢复检查点: LSN %d\n", lsn)
+	return nil
+}
+
+// decodeKVData 解码键值数据
+func (cb *TransactionRecoveryCallbacks) decodeKVData(data []byte) (key, value []byte, err error) {
+	if len(data) < 8 { // 至少需要两个长度字段
+		return nil, nil, fmt.Errorf("data too short")
+	}
+
+	// 读取key长度
+	keyLen := int(data[0])<<24 | int(data[1])<<16 | int(data[2])<<8 | int(data[3])
+	if len(data) < 4+keyLen+4 {
+		return nil, nil, fmt.Errorf("invalid key length")
+	}
+
+	// 读取key
+	key = make([]byte, keyLen)
+	copy(key, data[4:4+keyLen])
+
+	// 读取value长度
+	offset := 4 + keyLen
+	valueLen := int(data[offset])<<24 | int(data[offset+1])<<16 | int(data[offset+2])<<8 | int(data[offset+3])
+	if len(data) < offset+4+valueLen {
+		return nil, nil, fmt.Errorf("invalid value length")
+	}
+
+	// 读取value
+	value = make([]byte, valueLen)
+	copy(value, data[offset+4:offset+4+valueLen])
+
+	return key, value, nil
+}
+
+// GetStatistics 获取恢复统计信息
+func (cb *TransactionRecoveryCallbacks) GetStatistics() map[string]interface{} {
+	return map[string]interface{}{
+		"recovered_transactions": cb.recoveredTxns,
+		"recovered_operations":   cb.recoveredOps,
+		"failed_operations":      cb.failedOps,
+	}
+}
+
 // NewUnifiedRecoveryManager 创建统一恢复管理器
 func NewUnifiedRecoveryManager(walManager TxnWALManager, options *TxnWALOptions, callbacks RecoveryCallbacks) *UnifiedRecoveryManager {
 	return &UnifiedRecoveryManager{

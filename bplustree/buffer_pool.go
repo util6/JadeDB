@@ -185,6 +185,22 @@ func (bp *BufferPool) GetPage(pageID uint64) (*Page, error) {
 	return page, nil
 }
 
+// Contains 检查页面是否在缓冲池中
+// 这是一个非阻塞的检查方法，用于预读器避免重复加载
+func (bp *BufferPool) Contains(pageID uint64) bool {
+	// 计算分区索引
+	partIndex := bp.getPartitionIndex(pageID)
+	partition := bp.partitions[partIndex]
+
+	// 使用读锁进行非阻塞检查
+	partition.mutex.RLock()
+	defer partition.mutex.RUnlock()
+
+	// 检查页面是否在缓存中
+	_, exists := partition.pages[pageID]
+	return exists
+}
+
 // PutPage 将页面放回缓冲池
 func (bp *BufferPool) PutPage(page *Page) {
 	// 减少引用计数

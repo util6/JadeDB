@@ -52,12 +52,13 @@ macOS 平台特性：
 package file
 
 import (
+	"sync"
+	"time"
+
 	"github.com/golang/protobuf/proto"
 	"github.com/pkg/errors"
 	"github.com/util6/JadeDB/pb"
 	"github.com/util6/JadeDB/utils"
-	"sync"
-	"time"
 )
 
 // SSTable 表示一个不可变的排序字符串表文件。
@@ -408,21 +409,26 @@ func OpenSStable(opt *Options) *SSTable {
 		utils.Panic(err)
 	}
 
-	// TODO: 实现 TableIterator 来设置键范围
-	// 当前版本暂时跳过键范围的自动设置
-	// 在未来版本中，这里会使用迭代器来确定最小和最大键
-	//
-	// 计划实现：
-	// it := utils.NewTableIterator(ss)
-	// defer it.Close()
-	// it.Rewind()
-	// if it.Valid() {
-	//	ss.minKey = it.Key()
-	// }
-	// it.SeekToLast()
-	// if it.Valid() {
-	//	ss.maxKey = it.Key()
-	// }
+	// 实现 TableIterator 来设置键范围
+	// 使用我们实现的TableIterator来确定最小和最大键
+	if it, err := utils.NewTableIterator(ss, &utils.Options{IsAsc: true}); err == nil {
+		defer it.Close()
+
+		// 获取键范围信息
+		minKey := it.GetMinKey()
+		maxKey := it.GetMaxKey()
+
+		// 设置SSTable的键范围
+		if len(minKey) > 0 {
+			ss.minKey = make([]byte, len(minKey))
+			copy(ss.minKey, minKey)
+		}
+		if len(maxKey) > 0 {
+			ss.maxKey = make([]byte, len(maxKey))
+			copy(ss.maxKey, maxKey)
+		}
+	}
+	// 如果创建迭代器失败，继续使用原有逻辑（键范围为空）
 
 	return ss
 }

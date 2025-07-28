@@ -615,6 +615,9 @@ func (tb *tableBuilder) buildIndex(bloom []byte) ([]byte, uint32) {
 	tableIndex.KeyCount = tb.keyCount
 	tableIndex.MaxVersion = tb.maxVersion
 
+	// 设置陈旧数据大小，用于压缩决策
+	tableIndex.StaleDataSize = uint32(tb.staleDataSize)
+
 	// 生成并设置表索引的偏移量列表，这些偏移量指向表中的各个数据块。
 	tableIndex.Offsets = tb.writeBlockOffsets(tableIndex)
 

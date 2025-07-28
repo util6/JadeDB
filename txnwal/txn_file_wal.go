@@ -229,21 +229,104 @@ func (w *FileTxnWALManager) Sync(ctx context.Context) error {
 
 // ReadRecord 读取指定LSN的日志记录
 func (w *FileTxnWALManager) ReadRecord(ctx context.Context, lsn TxnLSN) (*TxnLogRecord, error) {
-	// 实现读取逻辑
-	// 这里需要实现从文件中读取指定LSN的记录
+	w.fileMutex.RLock()
+	defer w.fileMutex.RUnlock()
+
+	if w.currentFile == nil {
+		return nil, NewWALError(ErrWALNotFound, "no WAL file available", nil)
+	}
+
+	// 简化实现：从当前文件的开头扫描查找指定LSN
+	// 在生产环境中，这里应该使用索引或更高效的查找方法
+
+	// 获取文件大小（简化实现，假设文件不超过1MB）
+	maxSize := 1024 * 1024
+	data, err := w.currentFile.Bytes(0, maxSize)
+	if err != nil {
+		return nil, NewWALError(ErrWALCorrupted, "failed to read WAL file", err)
+	}
+
+	offset := 0
+	for offset < len(data) {
+		if offset+37 > len(data) { // 最小记录头大小
+			break
+		}
+
+		// 读取LSN
+		recordLSN := TxnLSN(binary.LittleEndian.Uint64(data[offset:]))
+		if recordLSN == lsn {
+			// 找到目标记录，解析完整记录
+			return w.deserializeTxnRecord(data[offset:])
+		}
+
+		// 跳过当前记录
+		if offset+29 > len(data) {
+			break
+		}
+		dataLen := binary.LittleEndian.Uint32(data[offset+29:])
+		recordSize := 37 + int(dataLen) // 头部37字节 + 数据长度
+		offset += recordSize
+	}
+
 	return nil, NewWALError(ErrWALNotFound, "record not found", nil)
 }
 
 // ReadRange 读取指定范围的日志记录
 func (w *FileTxnWALManager) ReadRange(ctx context.Context, startLSN, endLSN TxnLSN) ([]*TxnLogRecord, error) {
-	// 实现范围读取逻辑
-	return nil, NewWALError(ErrWALNotFound, "range read not implemented", nil)
+	w.fileMutex.RLock()
+	defer w.fileMutex.RUnlock()
+
+	if w.currentFile == nil {
+		return nil, NewWALError(ErrWALNotFound, "no WAL file available", nil)
+	}
+
+	var records []*TxnLogRecord
+
+	// 获取文件数据
+	maxSize := 1024 * 1024
+	data, err := w.currentFile.Bytes(0, maxSize)
+	if err != nil {
+		return nil, NewWALError(ErrWALCorrupted, "failed to read WAL file", err)
+	}
+
+	offset := 0
+	for offset < len(data) {
+		if offset+37 > len(data) {
+			break
+		}
+
+		// 读取LSN
+		recordLSN := TxnLSN(binary.LittleEndian.Uint64(data[offset:]))
+
+		// 检查是否在范围内
+		if recordLSN >= startLSN && recordLSN <= endLSN {
+			record, err := w.deserializeTxnRecord(data[offset:])
+			if err != nil {
+				return nil, err
+			}
+			records = append(records, record)
+		}
+
+		// 跳过当前记录
+		if offset+29 > len(data) {
+			break
+		}
+		dataLen := binary.LittleEndian.Uint32(data[offset+29:])
+		recordSize := 37 + int(dataLen)
+		offset += recordSize
+
+		// 如果已经超过结束LSN，可以提前退出
+		if recordLSN > endLSN {
+			break
+		}
+	}
+
+	return records, nil
 }
 
 // ReadFrom 从指定LSN开始读取
 func (w *FileTxnWALManager) ReadFrom(ctx context.Context, startLSN TxnLSN) (TxnWALIterator, error) {
-	// 实现迭代器创建逻辑
-	return nil, NewWALError(ErrWALNotFound, "iterator not implemented", nil)
+	return NewFileTxnWALIterator(w, startLSN)
 }
 
 // GetLatestLSN 获取最新的LSN
@@ -457,6 +540,63 @@ func (w *FileTxnWALManager) backgroundFlush() {
 	}
 }
 
+// deserializeTxnRecord 反序列化事务日志记录
+func (w *FileTxnWALManager) deserializeTxnRecord(data []byte) (*TxnLogRecord, error) {
+	if len(data) < 37 { // 最小记录大小
+		return nil, NewWALError(ErrWALCorrupted, "record too small", nil)
+	}
+
+	offset := 0
+
+	// LSN (8 bytes)
+	lsn := TxnLSN(binary.LittleEndian.Uint64(data[offset:]))
+	offset += 8
+
+	// Type (1 byte)
+	recordType := TxnLogRecordType(data[offset])
+	offset += 1
+
+	// Timestamp (8 bytes)
+	timestamp := time.Unix(0, int64(binary.LittleEndian.Uint64(data[offset:])))
+	offset += 8
+
+	// TxnID hash (8 bytes) - 简化处理，直接作为字符串
+	txnIDHash := binary.LittleEndian.Uint64(data[offset:])
+	txnID := fmt.Sprintf("txn_%d", txnIDHash)
+	offset += 8
+
+	// Data length (4 bytes)
+	dataLen := binary.LittleEndian.Uint32(data[offset:])
+	offset += 4
+
+	// Data
+	if len(data) < offset+int(dataLen)+4 { // +4 for checksum
+		return nil, NewWALError(ErrWALCorrupted, "incomplete record", nil)
+	}
+
+	recordData := make([]byte, dataLen)
+	copy(recordData, data[offset:offset+int(dataLen)])
+	offset += int(dataLen)
+
+	// Checksum (4 bytes)
+	checksum := binary.LittleEndian.Uint32(data[offset:])
+
+	// 验证校验和
+	expectedChecksum := crc32.ChecksumIEEE(data[:offset])
+	if checksum != expectedChecksum {
+		return nil, NewWALError(ErrWALChecksumFailed, "checksum mismatch", nil)
+	}
+
+	return &TxnLogRecord{
+		LSN:       lsn,
+		Type:      recordType,
+		TxnID:     txnID,
+		Timestamp: timestamp,
+		Data:      recordData,
+		Checksum:  checksum,
+	}, nil
+}
+
 // DefaultTxnWALOptions 返回默认WAL选项
 func DefaultTxnWALOptions() *TxnWALOptions {
 	return &TxnWALOptions{
@@ -470,4 +610,111 @@ func DefaultTxnWALOptions() *TxnWALOptions {
 		EnableChecksum:    true,
 		ChecksumAlgorithm: "crc32",
 	}
+}
+
+// FileTxnWALIterator 文件WAL迭代器
+type FileTxnWALIterator struct {
+	walManager *FileTxnWALManager
+	data       []byte
+	offset     int
+	current    *TxnLogRecord
+	err        error
+	startLSN   TxnLSN
+}
+
+// NewFileTxnWALIterator 创建文件WAL迭代器
+func NewFileTxnWALIterator(walManager *FileTxnWALManager, startLSN TxnLSN) (*FileTxnWALIterator, error) {
+	walManager.fileMutex.RLock()
+	defer walManager.fileMutex.RUnlock()
+
+	if walManager.currentFile == nil {
+		return nil, NewWALError(ErrWALNotFound, "no WAL file available", nil)
+	}
+
+	// 读取文件数据
+	maxSize := 1024 * 1024
+	data, err := walManager.currentFile.Bytes(0, maxSize)
+	if err != nil {
+		return nil, NewWALError(ErrWALCorrupted, "failed to read WAL file", err)
+	}
+
+	iterator := &FileTxnWALIterator{
+		walManager: walManager,
+		data:       data,
+		offset:     0,
+		startLSN:   startLSN,
+	}
+
+	// 定位到起始LSN
+	iterator.seekToLSN(startLSN)
+
+	return iterator, nil
+}
+
+// seekToLSN 定位到指定LSN
+func (it *FileTxnWALIterator) seekToLSN(targetLSN TxnLSN) {
+	it.offset = 0
+	for it.offset < len(it.data) {
+		if it.offset+37 > len(it.data) {
+			break
+		}
+
+		// 读取LSN
+		recordLSN := TxnLSN(binary.LittleEndian.Uint64(it.data[it.offset:]))
+		if recordLSN >= targetLSN {
+			return // 找到起始位置
+		}
+
+		// 跳过当前记录
+		if it.offset+29 > len(it.data) {
+			break
+		}
+		dataLen := binary.LittleEndian.Uint32(it.data[it.offset+29:])
+		recordSize := 37 + int(dataLen)
+		it.offset += recordSize
+	}
+}
+
+// Next 移动到下一条记录
+func (it *FileTxnWALIterator) Next() bool {
+	if it.err != nil || it.offset >= len(it.data) {
+		return false
+	}
+
+	// 尝试读取当前位置的记录
+	record, err := it.walManager.deserializeTxnRecord(it.data[it.offset:])
+	if err != nil {
+		it.err = err
+		return false
+	}
+
+	it.current = record
+
+	// 移动到下一条记录
+	if it.offset+29 > len(it.data) {
+		return true // 这是最后一条记录
+	}
+	dataLen := binary.LittleEndian.Uint32(it.data[it.offset+29:])
+	recordSize := 37 + int(dataLen)
+	it.offset += recordSize
+
+	return true
+}
+
+// Record 获取当前记录
+func (it *FileTxnWALIterator) Record() *TxnLogRecord {
+	return it.current
+}
+
+// Error 获取迭代过程中的错误
+func (it *FileTxnWALIterator) Error() error {
+	return it.err
+}
+
+// Close 关闭迭代器
+func (it *FileTxnWALIterator) Close() error {
+	it.walManager = nil
+	it.data = nil
+	it.current = nil
+	return nil
 }

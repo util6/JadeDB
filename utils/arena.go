@@ -311,7 +311,7 @@ func (s *Arena) getNodeOffset(nd *node) uint32 {
 	if nd == nil {
 		return 0
 	}
-	// TODO: 实现获取节点偏移量的逻辑
+	// 实现获取节点偏移量的逻辑
 	// 计算并返回节点在Arena中的偏移量
 	// 使用unsafe包来计算指针之间的偏移量
 	// 这里通过计算节点指针nd与Arena缓冲区起始指针的差值，得到节点在Arena中的偏移量

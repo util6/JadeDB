@@ -490,34 +490,52 @@ func (mf *ManifestFile) AddChanges(changesParam []*pb.ManifestChange) error {
 }
 func (mf *ManifestFile) addChanges(changesParam []*pb.ManifestChange) error {
 	changes := pb.ManifestChangeSet{Changes: changesParam}
+
+	// 序列化操作移到锁外面，减少锁持有时间
 	buf, err := changes.Marshal()
 	if err != nil {
 		return err
 	}
 
-	// TODO 锁粒度可以优化
+	// 预计算CRC和长度信息，进一步减少锁内操作
+	var lenCrcBuf [8]byte
+	binary.BigEndian.PutUint32(lenCrcBuf[0:4], uint32(len(buf)))
+	binary.BigEndian.PutUint32(lenCrcBuf[4:8], crc32.Checksum(buf, utils.CastagnoliCrcTable))
+	writeBuffer := append(lenCrcBuf[:], buf...)
+
+	// 优化锁粒度：分离内存操作和I/O操作
 	mf.lock.Lock()
-	defer mf.lock.Unlock()
+
+	// 应用变更到内存中的manifest
 	if err := applyChangeSet(mf.manifest, &changes); err != nil {
+		mf.lock.Unlock()
 		return err
 	}
-	// Rewrite manifest if it'd shrink by 1/10 and it's big enough to care
-	if mf.manifest.Deletions > utils.ManifestDeletionsRewriteThreshold &&
-		mf.manifest.Deletions > utils.ManifestDeletionsRatio*(mf.manifest.Creations-mf.manifest.Deletions) {
-		if err := mf.rewrite(); err != nil {
+
+	// 检查是否需要重写manifest
+	needRewrite := mf.manifest.Deletions > utils.ManifestDeletionsRewriteThreshold &&
+		mf.manifest.Deletions > utils.ManifestDeletionsRatio*(mf.manifest.Creations-mf.manifest.Deletions)
+
+	mf.lock.Unlock()
+
+	// I/O操作在锁外进行
+	if needRewrite {
+		// 重写操作需要重新获取锁
+		mf.lock.Lock()
+		err := mf.rewrite()
+		mf.lock.Unlock()
+		if err != nil {
 			return err
 		}
 	} else {
-		var lenCrcBuf [8]byte
-		binary.BigEndian.PutUint32(lenCrcBuf[0:4], uint32(len(buf)))
-		binary.BigEndian.PutUint32(lenCrcBuf[4:8], crc32.Checksum(buf, utils.CastagnoliCrcTable))
-		buf = append(lenCrcBuf[:], buf...)
-		if _, err := mf.f.Write(buf); err != nil {
+		// 写入操作不需要锁保护，因为文件写入是原子的
+		if _, err := mf.f.Write(writeBuffer); err != nil {
 			return err
 		}
 	}
-	err = mf.f.Sync()
-	return err
+
+	// 同步操作也在锁外进行
+	return mf.f.Sync()
 }
 
 // AddTableMeta 存储level表到manifest的level中

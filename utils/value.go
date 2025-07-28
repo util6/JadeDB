@@ -241,17 +241,26 @@ func IsDeletedOrExpired(meta byte, expiresAt uint64) bool {
 //   如果应丢弃该条目则返回 true；否则返回 false。
 
 func DiscardEntry(e, vs *Entry) bool {
-	// TODO 版本这个信息应该被弱化掉 在后面上 MVCC 或者多版本查询的时候再考虑
+	// 版本信息处理策略：
+	// 当前实现中版本信息被弱化处理，不进行严格的版本比较
+	// 这是为了简化当前的实现，在后续引入MVCC或多版本查询时再考虑严格的版本控制
+	//
+	// 被注释的版本检查逻辑：
 	// if vs.Version != ParseTs(e.Key) {
 	// 	// Version not found. Discard.
 	// 	return true
 	// }
+
+	// 检查条目是否已删除或过期
 	if IsDeletedOrExpired(vs.Meta, vs.ExpiresAt) {
 		return true
 	}
+
+	// 检查是否为值指针类型
 	if (vs.Meta & BitValuePointer) == 0 {
 		// Key 也存储了 LSM 中的 valueIndex。丢弃。
 		return true
 	}
+
 	return false
 }

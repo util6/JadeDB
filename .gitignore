@@ -2,3 +2,5 @@
 work_test
 testdata
 .idea
+.specstory
+wal_*

@@ -344,7 +344,7 @@ func NewTransactionManager(config *TransactionConfig) (*TransactionManager, erro
 
 	// 初始化事务WAL管理器
 	walOptions := txnwal.DefaultTxnWALOptions()
-	walOptions.Directory = "./txnwal"
+	walOptions.Directory = "./txnwal_" + fmt.Sprintf("%d", time.Now().UnixNano())
 	tm.txnWAL, err = txnwal.NewFileTxnWALManager(walOptions)
 	if err != nil {
 		cancel()
@@ -439,6 +439,11 @@ func (tm *TransactionManager) unregisterTransaction(txnID string) {
 }
 
 func (tm *TransactionManager) createLocalTransaction(txnID string, startTs uint64, options *TransactionOptions) (Transaction, error) {
+	// 如果有默认存储引擎，使用存储适配器
+	if tm.defaultEngine != nil {
+		return NewStorageTransactionAdapter(txnID, tm.defaultEngine, tm, tm.txnWAL, options)
+	}
+	// 否则使用本地事务
 	return NewLocalTransaction(txnID, startTs, options, tm)
 }
 

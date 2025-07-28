@@ -21,11 +21,14 @@ JadeDB MVCC管理器
 package transaction
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/util6/JadeDB/txnwal"
 )
 
 // MVCCManager MVCC管理器
@@ -47,6 +50,9 @@ type MVCCManager struct {
 
 	// 监控指标
 	metrics *MVCCMetrics
+
+	// WAL集成
+	walManager txnwal.TxnWALManager
 
 	// 生命周期
 	stopCh chan struct{}
@@ -161,6 +167,82 @@ func NewMVCCManager(config *TransactionConfig) (*MVCCManager, error) {
 	go manager.gcService()
 
 	return manager, nil
+}
+
+// SetWALManager 设置WAL管理器
+func (m *MVCCManager) SetWALManager(walManager txnwal.TxnWALManager) {
+	m.walManager = walManager
+}
+
+// WriteVersionToWAL 将版本信息写入WAL
+func (m *MVCCManager) WriteVersionToWAL(key string, version *Version, opType txnwal.TxnLogRecordType) error {
+	if m.walManager == nil {
+		return nil // WAL未配置，跳过
+	}
+
+	// 构造版本数据
+	versionData := m.encodeVersionData(key, version)
+
+	// 创建WAL记录
+	record := &txnwal.TxnLogRecord{
+		Type:  opType,
+		TxnID: version.TxnID,
+		Data:  versionData,
+	}
+
+	// 写入WAL
+	ctx := context.Background()
+	_, err := m.walManager.WriteRecord(ctx, record)
+	return err
+}
+
+// encodeVersionData 编码版本数据
+func (m *MVCCManager) encodeVersionData(key string, version *Version) []byte {
+	// 简单的编码格式：[keyLen][key][valueLen][value][timestamp][txnID]
+	keyBytes := []byte(key)
+	keyLen := len(keyBytes)
+	valueLen := len(version.Value)
+
+	// 计算总大小
+	totalSize := 4 + keyLen + 4 + valueLen + 8 + len(version.TxnID)
+	data := make([]byte, totalSize)
+
+	offset := 0
+
+	// 编码key长度和key
+	data[offset] = byte(keyLen >> 24)
+	data[offset+1] = byte(keyLen >> 16)
+	data[offset+2] = byte(keyLen >> 8)
+	data[offset+3] = byte(keyLen)
+	offset += 4
+	copy(data[offset:], keyBytes)
+	offset += keyLen
+
+	// 编码value长度和value
+	data[offset] = byte(valueLen >> 24)
+	data[offset+1] = byte(valueLen >> 16)
+	data[offset+2] = byte(valueLen >> 8)
+	data[offset+3] = byte(valueLen)
+	offset += 4
+	copy(data[offset:], version.Value)
+	offset += valueLen
+
+	// 编码时间戳
+	timestamp := uint64(version.Timestamp)
+	data[offset] = byte(timestamp >> 56)
+	data[offset+1] = byte(timestamp >> 48)
+	data[offset+2] = byte(timestamp >> 40)
+	data[offset+3] = byte(timestamp >> 32)
+	data[offset+4] = byte(timestamp >> 24)
+	data[offset+5] = byte(timestamp >> 16)
+	data[offset+6] = byte(timestamp >> 8)
+	data[offset+7] = byte(timestamp)
+	offset += 8
+
+	// 编码事务ID
+	copy(data[offset:], []byte(version.TxnID))
+
+	return data
 }
 
 // RegisterTransaction 注册事务
@@ -459,48 +541,319 @@ func (manager *MVCCManager) calculateGCWatermark() uint64 {
 }
 
 // shouldKeepVersion 判断是否应该保留版本
+// 实现智能的版本保留策略，考虑多种因素
 func (manager *MVCCManager) shouldKeepVersion(version *Version) bool {
-	// 保留最近的版本
+	// 1. 保留最近创建的版本（防止过于激进的清理）
 	if time.Since(version.CreatedAt) < time.Hour {
 		return true
 	}
 
-	// 检查是否有事务依赖该版本
+	// 2. 检查版本是否被某个未提交的事务创建
 	manager.txnMutex.RLock()
 	defer manager.txnMutex.RUnlock()
 
-	for _, txnInfo := range manager.activeTxns {
-		if txnInfo.State == TxnStateActive && txnInfo.ReadTs >= version.Timestamp {
+	if txnInfo, exists := manager.activeTxns[version.TxnID]; exists {
+		// 如果创建这个版本的事务还活跃，必须保留版本
+		if txnInfo.State == TxnStateActive {
 			return true
 		}
 	}
 
+	// 3. 检查是否有活跃事务可能需要这个版本
+	for _, txnInfo := range manager.activeTxns {
+		if txnInfo.State == TxnStateActive {
+			// 如果事务的开始时间戳小于等于版本时间戳，
+			// 说明这个事务可能需要读取这个版本
+			if txnInfo.StartTs <= version.Timestamp {
+				return true
+			}
+
+			// 如果事务的读时间戳大于等于版本时间戳，
+			// 说明这个事务可能会读取这个版本
+			if txnInfo.ReadTs >= version.Timestamp {
+				return true
+			}
+		}
+	}
+
+	// 4. 对于已删除的版本，可以更激进地清理
+	// 但仍需要保证可见性
+	if version.Deleted {
+		// 已删除的版本如果没有活跃事务依赖，可以清理
+		return false
+	}
+
+	// 5. 默认不保留（可以被清理）
 	return false
 }
 
 // gcService 垃圾回收服务
+// 优化的垃圾回收服务，支持批量处理和智能调度
 func (manager *MVCCManager) gcService() {
 	defer manager.wg.Done()
 
-	ticker := time.NewTicker(manager.config.GCInterval)
-	defer ticker.Stop()
+	// 定时器：定期执行全量垃圾回收
+	fullGCTicker := time.NewTicker(manager.config.GCInterval)
+	defer fullGCTicker.Stop()
+
+	// 定时器：定期处理垃圾回收队列
+	batchGCTicker := time.NewTicker(manager.config.GCInterval / 10) // 更频繁的批量处理
+	defer batchGCTicker.Stop()
 
 	for {
 		select {
 		case <-manager.stopCh:
+			// 关闭前处理剩余的垃圾回收任务
+			manager.drainGCQueue()
 			return
-		case <-ticker.C:
+
+		case <-fullGCTicker.C:
+			// 定期执行全量垃圾回收
 			manager.GarbageCollect()
+
+		case <-batchGCTicker.C:
+			// 定期批量处理垃圾回收队列
+			if len(manager.gcQueue) > 0 {
+				manager.BatchGarbageCollect()
+			}
+
 		case task := <-manager.gcQueue:
-			manager.processGCTask(task)
+			// 立即处理单个垃圾回收任务
+			if task != nil {
+				manager.processGCTask(task)
+			}
+		}
+	}
+}
+
+// drainGCQueue 清空垃圾回收队列
+// 在关闭服务前处理所有剩余的垃圾回收任务
+func (manager *MVCCManager) drainGCQueue() {
+	for {
+		select {
+		case task := <-manager.gcQueue:
+			if task != nil {
+				manager.processGCTask(task)
+			}
+		default:
+			// 队列为空，退出
+			return
 		}
 	}
 }
 
 // processGCTask 处理垃圾回收任务
+// 处理单个键的特定版本垃圾回收任务
 func (manager *MVCCManager) processGCTask(task *GCTask) {
-	// 处理单个垃圾回收任务
-	// TODO: 实现具体的垃圾回收逻辑
+	if task == nil {
+		return
+	}
+
+	keyStr := string(task.Key)
+
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	// 获取版本链
+	chain, exists := manager.versions[keyStr]
+	if !exists {
+		return // 版本链不存在，可能已经被清理
+	}
+
+	chain.mu.Lock()
+	defer chain.mu.Unlock()
+
+	// 检查是否可以安全清理这个版本
+	watermark := manager.gcWatermark.Load()
+	if task.Timestamp > watermark {
+		return // 版本还不能被清理
+	}
+
+	// 查找并移除指定时间戳的版本
+	newVersions := make([]*Version, 0, len(chain.Versions))
+	var removedCount int64
+
+	for _, version := range chain.Versions {
+		if version.Timestamp == task.Timestamp {
+			// 再次检查是否可以安全移除
+			if manager.canRemoveVersion(version, watermark) {
+				removedCount++
+				continue // 跳过这个版本，即删除它
+			}
+		}
+		newVersions = append(newVersions, version)
+	}
+
+	// 更新版本链
+	if removedCount > 0 {
+		chain.Versions = newVersions
+
+		// 如果版本链为空，删除整个版本链
+		if len(chain.Versions) == 0 {
+			delete(manager.versions, keyStr)
+		}
+
+		// 更新统计信息
+		manager.metrics.GCVersions.Add(removedCount)
+		manager.metrics.ActiveVersions.Add(-removedCount)
+	}
+}
+
+// canRemoveVersion 检查版本是否可以安全移除
+func (manager *MVCCManager) canRemoveVersion(version *Version, watermark uint64) bool {
+	// 版本时间戳必须小于等于水位线
+	if version.Timestamp > watermark {
+		return false
+	}
+
+	// 检查是否有活跃事务可能需要这个版本
+	manager.txnMutex.RLock()
+	defer manager.txnMutex.RUnlock()
+
+	for _, txnInfo := range manager.activeTxns {
+		// 如果有活跃事务的开始时间戳小于等于版本时间戳，
+		// 说明这个事务可能需要读取这个版本
+		if txnInfo.StartTs <= version.Timestamp {
+			return false
+		}
+	}
+
+	return true
+}
+
+// BatchGarbageCollect 批量垃圾回收
+// 处理垃圾回收队列中的多个任务，提高效率
+func (manager *MVCCManager) BatchGarbageCollect() {
+	start := time.Now()
+	defer func() {
+		duration := time.Since(start).Nanoseconds()
+		manager.metrics.GCDuration.Add(duration)
+		manager.metrics.GCRuns.Add(1)
+	}()
+
+	// 批量处理垃圾回收任务
+	batchSize := manager.config.GCBatchSize
+	tasks := make([]*GCTask, 0, batchSize)
+
+	// 收集一批任务
+	for i := 0; i < batchSize; i++ {
+		select {
+		case task := <-manager.gcQueue:
+			if task != nil {
+				tasks = append(tasks, task)
+			}
+		default:
+			// 队列为空，停止收集
+			break
+		}
+	}
+
+	if len(tasks) == 0 {
+		return
+	}
+
+	// 按键分组任务，减少锁竞争
+	tasksByKey := make(map[string][]*GCTask)
+	for _, task := range tasks {
+		keyStr := string(task.Key)
+		tasksByKey[keyStr] = append(tasksByKey[keyStr], task)
+	}
+
+	// 批量处理每个键的任务
+	var totalRemoved int64
+	for keyStr, keyTasks := range tasksByKey {
+		removed := manager.batchProcessKeyTasks(keyStr, keyTasks)
+		totalRemoved += removed
+	}
+
+	// 更新统计信息
+	if totalRemoved > 0 {
+		manager.metrics.GCVersions.Add(totalRemoved)
+		manager.metrics.ActiveVersions.Add(-totalRemoved)
+	}
+}
+
+// batchProcessKeyTasks 批量处理单个键的垃圾回收任务
+func (manager *MVCCManager) batchProcessKeyTasks(keyStr string, tasks []*GCTask) int64 {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	// 获取版本链
+	chain, exists := manager.versions[keyStr]
+	if !exists {
+		return 0 // 版本链不存在
+	}
+
+	chain.mu.Lock()
+	defer chain.mu.Unlock()
+
+	// 获取当前水位线
+	watermark := manager.gcWatermark.Load()
+
+	// 创建要删除的时间戳集合
+	timestampsToRemove := make(map[uint64]bool)
+	for _, task := range tasks {
+		if task.Timestamp <= watermark {
+			timestampsToRemove[task.Timestamp] = true
+		}
+	}
+
+	// 过滤版本链，移除可以清理的版本
+	newVersions := make([]*Version, 0, len(chain.Versions))
+	var removedCount int64
+
+	for _, version := range chain.Versions {
+		if timestampsToRemove[version.Timestamp] && manager.canRemoveVersion(version, watermark) {
+			removedCount++
+			continue // 跳过这个版本，即删除它
+		}
+		newVersions = append(newVersions, version)
+	}
+
+	// 更新版本链
+	if removedCount > 0 {
+		chain.Versions = newVersions
+
+		// 如果版本链为空，删除整个版本链
+		if len(chain.Versions) == 0 {
+			delete(manager.versions, keyStr)
+		}
+	}
+
+	return removedCount
+}
+
+// ForceGarbageCollect 强制垃圾回收
+// 立即执行一次完整的垃圾回收，不考虑时间间隔
+func (manager *MVCCManager) ForceGarbageCollect() {
+	// 先处理队列中的任务
+	manager.BatchGarbageCollect()
+
+	// 再执行全量垃圾回收
+	manager.GarbageCollect()
+}
+
+// GetGCStats 获取垃圾回收统计信息
+func (manager *MVCCManager) GetGCStats() map[string]interface{} {
+	return map[string]interface{}{
+		"gc_runs":         manager.metrics.GCRuns.Load(),
+		"gc_versions":     manager.metrics.GCVersions.Load(),
+		"gc_duration_ns":  manager.metrics.GCDuration.Load(),
+		"gc_watermark":    manager.gcWatermark.Load(),
+		"gc_queue_size":   len(manager.gcQueue),
+		"active_versions": manager.metrics.ActiveVersions.Load(),
+		"total_versions":  manager.metrics.TotalVersions.Load(),
+		"avg_gc_duration": manager.getAvgGCDuration(),
+	}
+}
+
+// getAvgGCDuration 计算平均垃圾回收时间
+func (manager *MVCCManager) getAvgGCDuration() int64 {
+	runs := manager.metrics.GCRuns.Load()
+	if runs == 0 {
+		return 0
+	}
+	return manager.metrics.GCDuration.Load() / runs
 }
 
 // GetMetrics 获取MVCC指标

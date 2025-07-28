@@ -47,6 +47,8 @@ var (
 
 	// ErrInvalidRequest is returned if the user request is invalid.
 	ErrInvalidRequest = errors.New("Invalid request")
+	// ErrInvalidSSTable is returned if the provided SSTable is invalid.
+	ErrInvalidSSTable = errors.New("Invalid SSTable")
 	// ErrNoRewrite is returned if a call for valueIndex log GC doesn't result in a log file rewrite.
 	ErrNoRewrite = errors.New("Value log GC attempt didn't result in any cleanup")
 

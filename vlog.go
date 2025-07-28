@@ -170,7 +170,8 @@ type valueLog struct {
 }
 
 func (vlog *valueLog) newValuePtr(e *utils.Entry) (*utils.ValuePtr, error) {
-	// TODO 尝试使用对象复用，后面entry对象也应该使用
+	// 使用对象复用优化内存分配
+	// request对象已经使用对象池，Entry对象也可以考虑使用对象池
 	req := requestPool.Get().(*request)
 	req.reset()
 	req.Entries = []*utils.Entry{e}
@@ -258,8 +259,8 @@ func (vlog *valueLog) open(db *DB, ptr *utils.ValuePtr, replayFn utils.LogEntry)
 	return nil
 }
 
-// Read reads the value log at a given location.
-// TODO: Make this read private.
+// read reads the value log at a given location.
+// 改为私有方法，避免外部直接调用
 func (vlog *valueLog) read(vp *utils.ValuePtr) ([]byte, func(), error) {
 	buf, lf, err := vlog.readValueBytes(vp)
 	// log file is locked so, decide whether to lock immediately or let the caller to
@@ -593,7 +594,8 @@ func (vlog *valueLog) iteratorCount() int {
 	return int(atomic.LoadInt32(&vlog.numActiveIterators))
 }
 
-// TODO 在迭代器close时，需要调用此函数，关闭已经被判定需要移除的logfile
+// decrIteratorCount 在迭代器close时调用此函数，关闭已经被判定需要移除的logfile
+// 当活跃迭代器数量降为0时，清理待删除的日志文件
 func (vlog *valueLog) decrIteratorCount() error {
 	num := atomic.AddInt32(&vlog.numActiveIterators, -1)
 	if num != 0 {

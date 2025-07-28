@@ -243,19 +243,34 @@ loop:
 	return validEndOffset, nil
 }
 
-// Truncate _
-// TODO Truncate 函数
+// Truncate 截断WAL文件到指定位置
+// 用于在恢复过程中移除损坏或不完整的数据
 func (wf *WalFile) Truncate(end int64) error {
+	// 参数验证：截断位置必须大于0
 	if end <= 0 {
 		return nil
 	}
-	if fi, err := wf.f.Fd.Stat(); err != nil {
-		return fmt.Errorf("while file.stat on file: %s, error: %v\n", wf.Name(), err)
-	} else if fi.Size() == end {
+
+	// 获取当前文件大小
+	fi, err := wf.f.Fd.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat WAL file %s: %w", wf.Name(), err)
+	}
+
+	// 如果文件大小已经等于目标大小，无需截断
+	if fi.Size() == end {
 		return nil
 	}
+
+	// 更新内部大小记录
 	wf.size = uint32(end)
-	return wf.f.Truncature(end)
+
+	// 执行文件截断操作
+	if err := wf.f.Truncature(end); err != nil {
+		return fmt.Errorf("failed to truncate WAL file %s to %d bytes: %w", wf.Name(), end, err)
+	}
+
+	return nil
 }
 
 // 封装kv分离的读操作

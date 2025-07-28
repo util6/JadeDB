@@ -778,7 +778,8 @@ func (lm *levelManager) sortByStaleDataSize(tables []*table, cd *compactDef) {
 	if len(tables) == 0 || cd.nextLevel == nil {
 		return
 	}
-	// TODO 统计一个 sst文件中陈旧数据的数量，涉及对存储格式的修改
+	// 统计SST文件中陈旧数据的数量，按陈旧数据大小排序
+	// 陈旧数据大小已在tableBuilder中统计，并存储在TableIndex.StaleDataSize中
 	sort.Slice(tables, func(i, j int) bool {
 		return tables[i].StaleDataSize() > tables[j].StaleDataSize()
 	})

@@ -102,9 +102,10 @@ type AccessHistory struct {
 
 // AccessRecord 访问记录
 type AccessRecord struct {
-	PageID    uint64    // 页面ID
-	Timestamp time.Time // 访问时间
-	SeqNum    uint64    // 序列号
+	PageID      uint64    // 页面ID
+	Timestamp   time.Time // 访问时间
+	SeqNum      uint64    // 序列号
+	AccessCount int       // 访问次数
 }
 
 // PatternDetector 模式检测器
@@ -226,11 +227,26 @@ func (ah *AccessHistory) RecordAccess(pageID uint64) {
 	ah.mutex.Lock()
 	defer ah.mutex.Unlock()
 
+	// 查找是否已存在该页面的记录
+	for e := ah.recentPages.Front(); e != nil; e = e.Next() {
+		record := e.Value.(*AccessRecord)
+		if record.PageID == pageID {
+			// 更新现有记录
+			record.Timestamp = time.Now()
+			record.AccessCount++
+
+			// 将记录移到前面（LRU策略）
+			ah.recentPages.MoveToFront(e)
+			return
+		}
+	}
+
 	// 添加新的访问记录
 	record := &AccessRecord{
-		PageID:    pageID,
-		Timestamp: time.Now(),
-		SeqNum:    uint64(ah.recentPages.Len()),
+		PageID:      pageID,
+		Timestamp:   time.Now(),
+		SeqNum:      uint64(ah.recentPages.Len()),
+		AccessCount: 1,
 	}
 
 	ah.recentPages.PushFront(record)
@@ -242,22 +258,91 @@ func (ah *AccessHistory) RecordAccess(pageID uint64) {
 }
 
 // GetRelatedPages 获取相关页面
+// 实现智能的相关性算法，基于时间局部性、空间局部性和访问频率
 func (ah *AccessHistory) GetRelatedPages(pageID uint64, maxCount int) []uint64 {
 	ah.mutex.RLock()
 	defer ah.mutex.RUnlock()
 
-	var related []uint64
+	// 候选页面及其相关性分数
+	candidates := make(map[uint64]float64)
 
-	// 简单实现：返回最近访问的页面
-	// TODO: 实现更智能的相关性算法
-	for e := ah.recentPages.Front(); e != nil && len(related) < maxCount; e = e.Next() {
+	// 当前时间，用于计算时间衰减
+	now := time.Now()
+
+	// 遍历访问历史，计算相关性分数
+	for e := ah.recentPages.Front(); e != nil; e = e.Next() {
 		record := e.Value.(*AccessRecord)
-		if record.PageID != pageID {
-			related = append(related, record.PageID)
+		if record.PageID == pageID {
+			continue // 跳过自己
+		}
+
+		// 计算相关性分数
+		score := ah.calculateRelatedness(pageID, record, now)
+		if score > 0 {
+			candidates[record.PageID] = score
 		}
 	}
 
-	return related
+	// 按分数排序并选择前maxCount个
+	return ah.selectTopCandidates(candidates, maxCount)
+}
+
+// calculateRelatedness 计算页面相关性分数
+func (ah *AccessHistory) calculateRelatedness(targetPageID uint64, record *AccessRecord, now time.Time) float64 {
+	var score float64
+
+	// 1. 时间局部性：最近访问的页面分数更高
+	timeDiff := now.Sub(record.Timestamp)
+	timeScore := 1.0 / (1.0 + timeDiff.Seconds()/3600.0) // 1小时衰减
+
+	// 2. 空间局部性：相邻页面分数更高
+	distance := int64(targetPageID) - int64(record.PageID)
+	if distance < 0 {
+		distance = -distance
+	}
+	spatialScore := 1.0 / (1.0 + float64(distance)/10.0) // 距离10个页面内有较高分数
+
+	// 3. 访问频率：频繁访问的页面分数更高
+	frequencyScore := float64(record.AccessCount) / 10.0 // 访问次数归一化
+	if frequencyScore > 1.0 {
+		frequencyScore = 1.0
+	}
+
+	// 综合分数：加权平均
+	score = 0.4*timeScore + 0.4*spatialScore + 0.2*frequencyScore
+
+	return score
+}
+
+// selectTopCandidates 选择分数最高的候选页面
+func (ah *AccessHistory) selectTopCandidates(candidates map[uint64]float64, maxCount int) []uint64 {
+	// 创建分数-页面ID对的切片
+	type candidate struct {
+		pageID uint64
+		score  float64
+	}
+
+	var candidateList []candidate
+	for pageID, score := range candidates {
+		candidateList = append(candidateList, candidate{pageID: pageID, score: score})
+	}
+
+	// 按分数降序排序
+	for i := 0; i < len(candidateList)-1; i++ {
+		for j := i + 1; j < len(candidateList); j++ {
+			if candidateList[i].score < candidateList[j].score {
+				candidateList[i], candidateList[j] = candidateList[j], candidateList[i]
+			}
+		}
+	}
+
+	// 选择前maxCount个
+	var result []uint64
+	for i := 0; i < len(candidateList) && i < maxCount; i++ {
+		result = append(result, candidateList[i].pageID)
+	}
+
+	return result
 }
 
 // AccessPattern 访问模式枚举
@@ -307,8 +392,11 @@ func (pw *PrefetchWorker) run() {
 // processPrefetchTask 处理预读任务
 func (pw *PrefetchWorker) processPrefetchTask(task *PrefetchTask) {
 	// 检查页面是否已在缓冲池中
-	// 这里需要一个非阻塞的检查方法
-	// TODO: 实现BufferPool.Contains方法
+	// 使用非阻塞的Contains方法避免重复加载
+	if pw.prefetcher.bufferPool.Contains(task.PageID) {
+		// 页面已在缓存中，跳过预读
+		return
+	}
 
 	// 异步加载页面到缓冲池
 	_, err := pw.prefetcher.bufferPool.GetPage(task.PageID)
