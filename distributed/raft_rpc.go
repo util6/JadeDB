@@ -338,7 +338,7 @@ func (s *RaftRPCServer) HandleRequestVote(req *RequestVoteRequest) *RequestVoteR
 	if req.Term > currentTerm {
 		s.node.becomeFollower(req.Term, "")
 		currentTerm = req.Term
-		votedFor = ""
+		votedFor = s.node.votedFor.Load().(string) // 重新获取更新后的votedFor
 	}
 
 	// 检查是否已经投票
@@ -460,8 +460,18 @@ func (s *RaftRPCServer) HandleInstallSnapshot(req *InstallSnapshotRequest) *Inst
 		currentTerm = req.Term
 	}
 
-	// TODO: 实现快照安装逻辑
-	// 这里需要将快照数据写入状态机，并更新日志
+	// 安装快照
+	err := s.node.InstallSnapshot(req)
+	if err != nil {
+		s.logger.Printf("Failed to install snapshot: %v", err)
+		// 即使安装失败，也要返回当前任期
+		return &InstallSnapshotResponse{
+			Term: currentTerm,
+		}
+	}
+
+	s.logger.Printf("Successfully installed snapshot from %s, lastIncludedIndex: %d",
+		req.LeaderID, req.LastIncludedIndex)
 
 	return &InstallSnapshotResponse{
 		Term: currentTerm,

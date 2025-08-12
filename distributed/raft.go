@@ -24,6 +24,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,6 +47,18 @@ type RaftNode struct {
 	log         *RaftLog
 	commitIndex atomic.Uint64
 	lastApplied atomic.Uint64
+
+	// 快照状态
+	lastSnapshotIndex atomic.Uint64 // 最后快照包含的日志索引
+	lastSnapshotTerm  atomic.Uint64 // 最后快照包含的日志任期
+
+	// 快照管理
+	snapshotThreshold int          // 快照阈值（日志条目数）
+	snapshotTicker    *time.Ticker // 快照定时器
+
+	// 生命周期管理
+	ctx    context.Context    // 节点上下文
+	cancel context.CancelFunc // 取消函数
 
 	// 领导者状态（仅领导者使用）
 	nextIndex  map[string]uint64 // 下一个发送给每个节点的日志索引
@@ -180,6 +193,17 @@ func NewRaftNode(nodeID string, peers []string, config *RaftConfig, stateMachine
 	node.leader.Store("")
 	node.lastHeartbeat.Store(time.Now())
 
+	// 初始化快照状态
+	node.lastSnapshotIndex.Store(0)
+	node.lastSnapshotTerm.Store(0)
+	node.snapshotThreshold = 1000 // 默认1000条日志后创建快照
+
+	// 初始化生命周期管理
+	node.ctx, node.cancel = context.WithCancel(context.Background())
+
+	// 启动快照管理器
+	node.startSnapshotManager()
+
 	// 初始化集群节点
 	for _, peerAddr := range peers {
 		if peerAddr != nodeID {
@@ -222,7 +246,27 @@ func (rn *RaftNode) Start() error {
 func (rn *RaftNode) Stop() error {
 	rn.logger.Printf("Stopping Raft node: %s", rn.nodeID)
 
-	close(rn.stopCh)
+	// 防止重复停止
+	rn.mu.Lock()
+	select {
+	case <-rn.stopCh:
+		// 已经停止
+		rn.mu.Unlock()
+		return nil
+	default:
+		// 继续停止流程
+		close(rn.stopCh)
+		rn.mu.Unlock()
+	}
+
+	// 停止快照管理器
+	if rn.cancel != nil {
+		rn.cancel()
+	}
+	if rn.snapshotTicker != nil {
+		rn.snapshotTicker.Stop()
+	}
+
 	rn.wg.Wait()
 
 	if err := rn.rpcServer.Stop(); err != nil {
@@ -277,7 +321,8 @@ func (rn *RaftNode) tickCandidate() {
 	lastHeartbeat := rn.lastHeartbeat.Load().(time.Time)
 	if time.Since(lastHeartbeat) > rn.electionTimeout {
 		rn.logger.Printf("Election timeout, starting new election")
-		rn.startElection()
+		// 重新成为候选者，增加任期并开始新的选举
+		rn.becomeCandidate()
 	}
 }
 
@@ -285,6 +330,9 @@ func (rn *RaftNode) tickCandidate() {
 func (rn *RaftNode) tickLeader() {
 	// 发送心跳
 	rn.sendHeartbeats()
+
+	// 尝试提交日志（对单节点集群很重要）
+	rn.tryCommit()
 }
 
 // becomeFollower 成为跟随者
@@ -338,8 +386,16 @@ func (rn *RaftNode) startElection() {
 
 	rn.logger.Printf("Starting election, term: %d", currentTerm)
 
-	votes := 1 // 自己的票
-	votesNeeded := len(rn.peers)/2 + 1
+	votes := 1                      // 自己的票
+	totalNodes := len(rn.peers) + 1 // 包括自己
+	votesNeeded := totalNodes/2 + 1
+
+	// 单节点集群直接成为领导者
+	if totalNodes == 1 {
+		rn.logger.Printf("Single node cluster, becoming leader immediately")
+		rn.becomeLeader()
+		return
+	}
 
 	// 并发向所有节点请求投票
 	var wg sync.WaitGroup
@@ -412,7 +468,28 @@ func (rn *RaftNode) sendHeartbeats() {
 
 // sendAppendEntries 发送日志条目
 func (rn *RaftNode) sendAppendEntries(peerID string, peer *RaftPeer) {
+	// 加锁保护nextIndex的读取
+	rn.mu.Lock()
 	nextIndex := rn.nextIndex[peerID]
+	rn.mu.Unlock()
+
+	lastSnapshotIndex := rn.lastSnapshotIndex.Load()
+
+	// 检查是否需要发送快照
+	// 如果跟随者需要的日志条目已经被压缩到快照中，则发送快照
+	if nextIndex <= lastSnapshotIndex {
+		rn.logger.Printf("Peer %s needs snapshot: nextIndex=%d, lastSnapshotIndex=%d",
+			peerID, nextIndex, lastSnapshotIndex)
+
+		// 异步发送快照，避免阻塞心跳
+		go func() {
+			if err := rn.SendSnapshot(peerID); err != nil {
+				rn.logger.Printf("Failed to send snapshot to peer %s: %v", peerID, err)
+			}
+		}()
+		return
+	}
+
 	prevLogIndex := nextIndex - 1
 	prevLogTerm := rn.log.getTerm(prevLogIndex)
 
@@ -451,6 +528,10 @@ func (rn *RaftNode) handleAppendEntriesResponse(peerID string, req *AppendEntrie
 		return
 	}
 
+	// 加锁保护nextIndex和matchIndex的并发访问
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
 	if resp.Success {
 		// 成功复制，更新索引
 		if len(req.Entries) > 0 {
@@ -472,6 +553,15 @@ func (rn *RaftNode) handleAppendEntriesResponse(peerID string, req *AppendEntrie
 func (rn *RaftNode) tryCommit() {
 	currentTerm := rn.currentTerm.Load()
 	lastLogIndex := rn.log.getLastIndex()
+
+	// 单节点集群直接提交所有日志
+	if len(rn.peers) == 0 {
+		if lastLogIndex > rn.commitIndex.Load() {
+			rn.commitIndex.Store(lastLogIndex)
+			rn.logger.Printf("Single node: committed log up to index: %d, term: %d", lastLogIndex, currentTerm)
+		}
+		return
+	}
 
 	// 从最新的日志开始检查
 	for index := lastLogIndex; index > rn.commitIndex.Load(); index-- {
@@ -503,8 +593,11 @@ func (rn *RaftNode) getState() RaftState {
 
 // resetElectionTimeout 重置选举超时
 func (rn *RaftNode) resetElectionTimeout() {
-	// 使用配置的选举超时
-	rn.electionTimeout = rn.config.ElectionTimeout
+	// 随机化选举超时以避免选举冲突
+	// 选举超时在 [electionTimeout, 2*electionTimeout) 范围内随机
+	baseTimeout := rn.config.ElectionTimeout
+	randomTimeout := time.Duration(rand.Int63n(int64(baseTimeout))) + baseTimeout
+	rn.electionTimeout = randomTimeout
 	rn.lastHeartbeat.Store(time.Now())
 }
 
@@ -626,6 +719,184 @@ func (rn *RaftNode) GetTerm() uint64 {
 	return rn.currentTerm.Load()
 }
 
+// CreateSnapshot 创建快照
+// 这个方法由领导者调用，用于压缩日志
+func (rn *RaftNode) CreateSnapshot() error {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	// 只有在有足够的已提交日志时才创建快照
+	commitIndex := rn.commitIndex.Load()
+	lastSnapshotIndex := rn.lastSnapshotIndex.Load()
+
+	// 检查是否需要创建快照
+	if commitIndex <= lastSnapshotIndex {
+		return fmt.Errorf("no new committed entries to snapshot")
+	}
+
+	// 从状态机创建快照
+	snapshotData, err := rn.stateMachine.Snapshot()
+	if err != nil {
+		return fmt.Errorf("failed to create state machine snapshot: %w", err)
+	}
+
+	// 获取快照包含的最后一个日志条目的信息
+	lastIncludedIndex := commitIndex
+	lastIncludedTerm := rn.log.getTerm(lastIncludedIndex)
+
+	// 更新快照状态
+	rn.lastSnapshotIndex.Store(lastIncludedIndex)
+	rn.lastSnapshotTerm.Store(lastIncludedTerm)
+
+	// 压缩日志（删除已包含在快照中的日志条目）
+	rn.log.compactTo(lastIncludedIndex)
+
+	rn.logger.Printf("Created snapshot: lastIncludedIndex=%d, lastIncludedTerm=%d, size=%d",
+		lastIncludedIndex, lastIncludedTerm, len(snapshotData))
+
+	return nil
+}
+
+// InstallSnapshot 安装快照
+// 这个方法由跟随者调用，用于从领导者接收快照
+func (rn *RaftNode) InstallSnapshot(req *InstallSnapshotRequest) error {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	// 检查任期
+	currentTerm := rn.currentTerm.Load()
+	if req.Term < currentTerm {
+		return fmt.Errorf("snapshot term %d is older than current term %d", req.Term, currentTerm)
+	}
+
+	// 如果快照比当前状态旧，忽略
+	if req.LastIncludedIndex <= rn.lastSnapshotIndex.Load() {
+		rn.logger.Printf("Ignoring old snapshot: lastIncludedIndex=%d, current=%d",
+			req.LastIncludedIndex, rn.lastSnapshotIndex.Load())
+		return nil
+	}
+
+	// 恢复状态机
+	if err := rn.stateMachine.Restore(req.Data); err != nil {
+		return fmt.Errorf("failed to restore state machine from snapshot: %w", err)
+	}
+
+	// 更新快照状态
+	rn.lastSnapshotIndex.Store(req.LastIncludedIndex)
+	rn.lastSnapshotTerm.Store(req.LastIncludedTerm)
+
+	// 更新提交索引和应用索引
+	rn.commitIndex.Store(req.LastIncludedIndex)
+	rn.lastApplied.Store(req.LastIncludedIndex)
+
+	// 压缩日志
+	rn.log.compactTo(req.LastIncludedIndex)
+
+	rn.logger.Printf("Installed snapshot: lastIncludedIndex=%d, lastIncludedTerm=%d",
+		req.LastIncludedIndex, req.LastIncludedTerm)
+
+	return nil
+}
+
+// SendSnapshot 向指定节点发送快照
+// 当跟随者的日志太落后时，领导者会发送快照而不是日志条目
+func (rn *RaftNode) SendSnapshot(peerID string) error {
+	if rn.getState() != Leader {
+		return fmt.Errorf("only leader can send snapshots")
+	}
+
+	peer, exists := rn.peers[peerID]
+	if !exists {
+		return fmt.Errorf("peer %s not found", peerID)
+	}
+
+	// 创建快照数据
+	snapshotData, err := rn.stateMachine.Snapshot()
+	if err != nil {
+		return fmt.Errorf("failed to create snapshot: %w", err)
+	}
+
+	// 构建InstallSnapshot请求
+	req := &InstallSnapshotRequest{
+		Term:              rn.currentTerm.Load(),
+		LeaderID:          rn.nodeID,
+		LastIncludedIndex: rn.lastSnapshotIndex.Load(),
+		LastIncludedTerm:  rn.lastSnapshotTerm.Load(),
+		Offset:            0,
+		Data:              snapshotData,
+		Done:              true, // 简化实现，一次发送完整快照
+	}
+
+	rn.logger.Printf("Sending snapshot to %s, lastIncludedIndex: %d, size: %d",
+		peerID, req.LastIncludedIndex, len(snapshotData))
+
+	// 发送快照
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	resp, err := peer.client.InstallSnapshot(ctx, req)
+	if err != nil {
+		return fmt.Errorf("failed to send snapshot to %s: %w", peerID, err)
+	}
+
+	// 处理响应
+	if resp.Term > rn.currentTerm.Load() {
+		rn.becomeFollower(resp.Term, "")
+		return fmt.Errorf("received higher term %d from %s", resp.Term, peerID)
+	}
+
+	// 加锁保护nextIndex和matchIndex的并发访问
+	rn.mu.Lock()
+	// 更新该节点的nextIndex和matchIndex
+	rn.nextIndex[peerID] = req.LastIncludedIndex + 1
+	rn.matchIndex[peerID] = req.LastIncludedIndex
+	rn.mu.Unlock()
+
+	rn.logger.Printf("Successfully sent snapshot to %s", peerID)
+	return nil
+}
+
+// startSnapshotManager 启动快照管理器
+func (rn *RaftNode) startSnapshotManager() {
+	// 每30秒检查一次是否需要创建快照
+	rn.snapshotTicker = time.NewTicker(30 * time.Second)
+
+	go func() {
+		defer rn.snapshotTicker.Stop()
+
+		for {
+			select {
+			case <-rn.snapshotTicker.C:
+				rn.checkAndCreateSnapshot()
+			case <-rn.ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+// checkAndCreateSnapshot 检查并创建快照
+func (rn *RaftNode) checkAndCreateSnapshot() {
+	// 只有领导者创建快照
+	if rn.getState() != Leader {
+		return
+	}
+
+	// 检查是否需要创建快照
+	commitIndex := rn.commitIndex.Load()
+	lastSnapshotIndex := rn.lastSnapshotIndex.Load()
+
+	// 如果已提交的日志条目数超过阈值，则创建快照
+	if commitIndex-lastSnapshotIndex >= uint64(rn.snapshotThreshold) {
+		rn.logger.Printf("Creating snapshot: commitIndex=%d, lastSnapshotIndex=%d, threshold=%d",
+			commitIndex, lastSnapshotIndex, rn.snapshotThreshold)
+
+		if err := rn.CreateSnapshot(); err != nil {
+			rn.logger.Printf("Failed to create snapshot: %v", err)
+		}
+	}
+}
+
 // RaftMetrics Raft监控指标
 type RaftMetrics struct {
 	CurrentTerm    atomic.Int64
@@ -744,6 +1015,28 @@ func (rl *RaftLog) truncate(index uint64) {
 	}
 
 	rl.entries = rl.entries[:index-1]
+}
+
+// compactTo 压缩日志到指定索引
+// 删除索引之前的所有日志条目（这些条目已包含在快照中）
+func (rl *RaftLog) compactTo(index uint64) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	if index == 0 || index > uint64(len(rl.entries)) {
+		return
+	}
+
+	// 保留index之后的日志条目
+	compactCount := int(index)
+	if compactCount > len(rl.entries) {
+		compactCount = len(rl.entries)
+	}
+
+	// 创建新的日志条目切片，只保留未压缩的部分
+	newEntries := make([]LogEntry, len(rl.entries)-compactCount)
+	copy(newEntries, rl.entries[compactCount:])
+	rl.entries = newEntries
 }
 
 // LogStorage 日志存储接口

@@ -24,6 +24,7 @@ package distributed
 import (
 	"bytes"
 	"encoding/gob"
+	"encoding/json"
 	"fmt"
 	"log"
 	"sync"
@@ -294,10 +295,17 @@ func (sm *KVStateMachine) parseOperation(data []byte) (*Operation, error) {
 	}
 
 	var op Operation
+
+	// 首先尝试JSON解码（用于测试）
+	if err := json.Unmarshal(data, &op); err == nil {
+		return &op, nil
+	}
+
+	// 如果JSON解码失败，尝试gob解码（用于生产）
 	buf := bytes.NewBuffer(data)
 	decoder := gob.NewDecoder(buf)
 	if err := decoder.Decode(&op); err != nil {
-		return nil, fmt.Errorf("failed to decode operation: %w", err)
+		return nil, fmt.Errorf("failed to decode operation with both JSON and gob: %w", err)
 	}
 
 	return &op, nil
