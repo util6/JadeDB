@@ -32,7 +32,6 @@ package lsm
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
@@ -98,6 +97,11 @@ type memTable struct {
 	// 用于 MVCC（多版本并发控制）。
 	// 确保版本号的单调递增。
 	maxVersion uint64
+
+	// refCount 引用计数器，用于安全的内存表回收。
+	// 使用原子操作确保并发安全。
+	// 当引用计数为0时，内存表可以被安全回收。
+	refCount int32
 }
 
 // NewMemtable 创建一个新的内存表实例。
@@ -134,11 +138,14 @@ func (lsm *LSM) NewMemtable() *memTable {
 	}
 
 	// 创建并返回内存表实例
-	return &memTable{
-		wal: file.OpenWalFile(fileOpt),         // 打开 WAL 文件
-		sl:  utils.NewSkipList(int64(1 << 20)), // 创建 1MB 的跳表
-		lsm: lsm,                               // 设置 LSM 引用
+	mt := &memTable{
+		wal:      file.OpenWalFile(fileOpt),         // 打开 WAL 文件
+		sl:       utils.NewSkipList(int64(1 << 20)), // 创建 1MB 的跳表
+		lsm:      lsm,                               // 设置 LSM 引用
+		refCount: 1,                                 // 初始引用计数为1
 	}
+
+	return mt
 }
 
 // close 关闭内存表并释放相关资源。
@@ -245,12 +252,41 @@ func (m *memTable) Size() int64 {
 	return m.sl.MemSize()
 }
 
+// incrementRef 增加内存表的引用计数。
+// 当有新的使用者开始使用这个内存表时调用。
+// 使用原子操作确保并发安全。
+//
+// 返回值：
+// 增加后的引用计数值
+func (m *memTable) incrementRef() int32 {
+	return atomic.AddInt32(&m.refCount, 1)
+}
+
+// decrementRef 减少内存表的引用计数。
+// 当使用者不再使用这个内存表时调用。
+// 使用原子操作确保并发安全。
+//
+// 返回值：
+// 减少后的引用计数值，当返回0时表示可以安全回收
+func (m *memTable) decrementRef() int32 {
+	return atomic.AddInt32(&m.refCount, -1)
+}
+
+// getRefCount 获取当前的引用计数值。
+// 主要用于调试和监控。
+//
+// 返回值：
+// 当前的引用计数值
+func (m *memTable) getRefCount() int32 {
+	return atomic.LoadInt32(&m.refCount)
+}
+
 // recovery 用于从工作目录中恢复LSM树的状态。
 // 它会读取所有 wal 文件，并将这些文件中的数据加载到内存表中。
 
 func (lsm *LSM) recovery() (*memTable, []*memTable) {
 	// 从工作目录中获取所有文件
-	files, err := ioutil.ReadDir(lsm.option.WorkDir)
+	files, err := os.ReadDir(lsm.option.WorkDir)
 	if err != nil {
 		utils.Panic(err)
 		return nil, nil

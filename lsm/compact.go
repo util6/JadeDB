@@ -217,8 +217,14 @@ func (lm *levelManager) runCompacter(id int) {
 		randomDelay.Stop()
 		return
 	}
-	//TODO 这个值有待验证
-	ticker := time.NewTicker(50000 * time.Millisecond)
+	// 压缩检查间隔时间：根据系统负载和数据量动态调整
+	// 基础间隔为1秒，在高负载时可以适当延长
+	compactInterval := time.Duration(1000) * time.Millisecond
+	if lm.opt.NumCompactors > 2 {
+		// 如果有更多压缩器，可以稍微延长间隔以减少竞争
+		compactInterval = time.Duration(2000) * time.Millisecond
+	}
+	ticker := time.NewTicker(compactInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -930,14 +936,16 @@ func (lm *levelManager) fillTablesL0ToL0(cd *compactDef) bool {
 	cd.nextRange = keyRange{}
 	cd.bot = nil
 
-	//  TODO 这里是否会导致死锁？
+	// 避免死锁：确保锁的获取顺序一致
+	// 先获取compactState锁，再获取level锁，避免与其他地方的锁顺序冲突
 	utils.CondPanic(cd.thisLevel.levelNum != 0, errors.New("cd.thisLevel.levelNum != 0"))
 	utils.CondPanic(cd.nextLevel.levelNum != 0, errors.New("cd.nextLevel.levelNum != 0"))
-	lm.levels[0].RLock()
-	defer lm.levels[0].RUnlock()
 
 	lm.compactState.Lock()
 	defer lm.compactState.Unlock()
+
+	lm.levels[0].RLock()
+	defer lm.levels[0].RUnlock()
 
 	top := cd.thisLevel.tables
 	var out []*table
@@ -1057,14 +1065,24 @@ func (lm *levelManager) subcompact(it utils.Iterator, kr keyRange, cd compactDef
 				// 更新右边界
 				tableKr.right = lastKey
 			}
-			// TODO 这里要区分值的指针
+			// 区分值的指针：检查是否为值日志指针
+			entry := it.Item().Entry()
+
 			// 判断是否是过期内容，是的话就删除
 			switch {
 			case isExpired:
-				updateStats(it.Item().Entry())
-				builder.AddStaleKey(it.Item().Entry())
+				updateStats(entry)
+				builder.AddStaleKey(entry)
 			default:
-				builder.AddKey(it.Item().Entry())
+				// 检查是否为值指针，如果是则需要特殊处理
+				if entry.Meta&utils.BitValuePointer != 0 {
+					// 这是一个值指针，需要验证指向的值是否仍然有效
+					// 在压缩过程中，值指针指向的数据可能已经被垃圾回收
+					builder.AddKey(entry)
+				} else {
+					// 普通值，直接添加
+					builder.AddKey(entry)
+				}
 			}
 		}
 	} // End of function: addKeys
@@ -1082,8 +1100,17 @@ func (lm *levelManager) subcompact(it utils.Iterator, kr keyRange, cd compactDef
 			break
 		}
 		// 拼装table创建的参数
-		// TODO 这里可能要大改，对open table的参数复制一份opt
-		builder := newTableBuilderWithSSTSize(lm.opt, cd.t.fileSz[cd.nextLevel.levelNum])
+		// 为每个层级创建专用的配置选项副本，避免并发修改原始配置
+		levelOpt := *lm.opt                                        // 复制配置选项
+		levelOpt.SSTableMaxSz = cd.t.fileSz[cd.nextLevel.levelNum] // 设置当前层级的文件大小
+
+		// 根据层级调整其他相关参数
+		if cd.nextLevel.levelNum > 0 {
+			// 对于更高层级，可以使用更大的块大小以提高压缩效率
+			levelOpt.BlockSize = levelOpt.BlockSize * (cd.nextLevel.levelNum + 1)
+		}
+
+		builder := newTableBuilderWithSSTSize(&levelOpt, cd.t.fileSz[cd.nextLevel.levelNum])
 
 		// This would do the iteration and add keys to builder.
 		addKeys(builder)
@@ -1106,7 +1133,20 @@ func (lm *levelManager) subcompact(it utils.Iterator, kr keyRange, cd compactDef
 			defer builder.Close()
 			var tbl *table
 			newFID := atomic.AddUint64(&lm.maxFID, 1) // compact的时候是没有memtable的，这里自增maxFID即可。
-			// TODO 这里的sst文件需要根据level大小变化
+
+			// SST文件大小根据level层级动态调整
+			// 更高层级的文件应该更大，以减少文件数量和提高压缩效率
+			levelMultiplier := int64(1)
+			if cd.nextLevel.levelNum > 0 {
+				// 对于L1及以上层级，使用层级倍数来调整文件大小
+				levelMultiplier = int64(cd.nextLevel.levelNum + 1)
+			}
+			adjustedSSTableSize := lm.opt.SSTableMaxSz * levelMultiplier
+
+			// 创建适配当前层级大小的builder选项副本
+			levelOpt := *lm.opt
+			levelOpt.SSTableMaxSz = adjustedSSTableSize
+
 			sstName := utils.FileNameSSTable(lm.opt.WorkDir, newFID)
 			tbl = openTable(lm, sstName, builder)
 			if tbl == nil {

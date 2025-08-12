@@ -152,6 +152,13 @@ type Options struct {
 	// MaxLevelNum 设置 LSM 树的最大层级数。
 	MaxLevelNum int
 
+	// MaxImmutableTables 设置最大不可变内存表数量。
+	// 当不可变内存表数量超过此限制时，会强制刷盘。
+	// 较小的值可以减少内存使用但增加磁盘写入频率；
+	// 较大的值可以减少磁盘写入但占用更多内存。
+	// 推荐值：4-8。
+	MaxImmutableTables int
+
 	// DiscardStatsCh 提供丢弃统计信息的通道。
 	DiscardStatsCh *chan map[uint32]int64
 }
@@ -189,6 +196,7 @@ func NewDefaultOptions() *Options {
 		BaseTableSize:       2 << 20,  // 2MB
 		NumLevelZeroTables:  4,        // L0层最多4个表
 		MaxLevelNum:         7,        // 最多7层
+		MaxImmutableTables:  6,        // 最多6个不可变内存表
 	}
 
 	// 设置值阈值为工具包中定义的默认值

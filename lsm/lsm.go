@@ -32,6 +32,7 @@ LSM（Log-Structured Merge Tree）是 JadeDB 的核心存储引擎，
 package lsm
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -202,18 +203,34 @@ func (lsm *LSM) Set(entry *utils.Entry) (err error) {
 	if err = lsm.memTable.set(entry); err != nil {
 		return err
 	}
-	// 检查是否存在immutable需要刷盘，
+	// 检查是否存在immutable需要刷盘，使用引用计数安全回收
+	var flushedImmutables []*memTable
 	for _, immutable := range lsm.immutables {
 		if err = lsm.levels.flush(immutable); err != nil {
 			return err
 		}
-		// TODO 这里问题很大，应该是用引用计数的方式回收
-		err = immutable.close()
-		utils.Panic(err)
+		flushedImmutables = append(flushedImmutables, immutable)
 	}
+
+	// 安全回收已刷盘的immutable内存表
+	for _, immutable := range flushedImmutables {
+		// 使用引用计数方式安全回收，避免直接close导致的问题
+		if immutable.decrementRef() == 0 {
+			err = immutable.close()
+			if err != nil {
+				utils.Err(err) // 使用Err而不是Panic，避免程序崩溃
+			}
+		}
+	}
+
+	// 优化内存空间：重用切片而不是重新分配，限制队列大小
 	if len(lsm.immutables) != 0 {
-		// TODO 将lsm的immutables队列置空，这里可以优化一下节省内存空间，还可以限制一下immutable的大小为固定值
-		lsm.immutables = make([]*memTable, 0)
+		// 清空已处理的immutable，但保留底层数组以减少内存分配
+		lsm.immutables = lsm.immutables[:0]
+		// 如果切片容量过大，重新分配以节省内存
+		if cap(lsm.immutables) > lsm.option.MaxImmutableTables*2 {
+			lsm.immutables = make([]*memTable, 0, lsm.option.MaxImmutableTables)
+		}
 	}
 	return err
 }
@@ -243,6 +260,75 @@ func (lsm *LSM) Get(key []byte) (*utils.Entry, error) {
 	return lsm.levels.Get(key)
 }
 
+// GetStats 获取LSM引擎的详细统计信息。
+// 提供全面的性能监控数据，用于系统调优和问题诊断。
+//
+// 返回值：
+// 包含各种统计指标的映射表
+//
+// 统计信息包括：
+// - 内存表统计：活跃表大小、不可变表数量等
+// - 层级统计：各层文件数量、大小等
+// - 压缩统计：压缩次数、效率等
+// - 缓存统计：命中率、大小等
+func (lsm *LSM) GetStats() map[string]interface{} {
+	lsm.lock.RLock()
+	defer lsm.lock.RUnlock()
+
+	stats := make(map[string]interface{})
+
+	// 内存表统计
+	if lsm.memTable != nil {
+		stats["memtable_size"] = lsm.memTable.Size()
+		stats["memtable_ref_count"] = lsm.memTable.getRefCount()
+	}
+
+	// 不可变内存表统计
+	stats["immutable_count"] = len(lsm.immutables)
+	var totalImmutableSize int64
+	for _, immutable := range lsm.immutables {
+		if immutable != nil {
+			totalImmutableSize += immutable.Size()
+		}
+	}
+	stats["immutable_total_size"] = totalImmutableSize
+
+	// 层级统计
+	if lsm.levels != nil {
+		levelStats := make(map[string]interface{})
+		for i, level := range lsm.levels.levels {
+			level.RLock()
+			levelInfo := map[string]interface{}{
+				"table_count": len(level.tables),
+				"level_num":   level.levelNum,
+			}
+
+			var levelSize int64
+			for _, table := range level.tables {
+				if table != nil {
+					levelSize += table.Size()
+				}
+			}
+			levelInfo["total_size"] = levelSize
+			level.RUnlock()
+
+			levelStats[fmt.Sprintf("level_%d", i)] = levelInfo
+		}
+		stats["levels"] = levelStats
+	}
+
+	// 性能组件统计
+	if lsm.pipeline != nil {
+		stats["pipeline"] = lsm.pipeline.GetStats()
+	}
+
+	if lsm.coalescer != nil {
+		stats["coalescer"] = lsm.coalescer.GetStats()
+	}
+
+	return stats
+}
+
 func (lsm *LSM) Close() error {
 	// 关闭优化组件
 	if lsm.pipeline != nil {
@@ -254,12 +340,28 @@ func (lsm *LSM) Close() error {
 	// 等待全部合并过程的结束
 	// 等待全部api调用过程结束
 	lsm.closer.Close()
-	// TODO 需要加锁保证并发安全
+
+	// 加锁保证并发安全，防止在关闭过程中有其他操作修改memTable
+	lsm.lock.Lock()
+	defer lsm.lock.Unlock()
+
+	// 安全关闭当前活跃的内存表
 	if lsm.memTable != nil {
 		if err := lsm.memTable.close(); err != nil {
 			return err
 		}
+		lsm.memTable = nil // 设置为nil，避免重复关闭
 	}
+
+	// 安全关闭所有不可变内存表
+	for _, immutable := range lsm.immutables {
+		if immutable != nil {
+			if err := immutable.close(); err != nil {
+				utils.Err(err) // 记录错误但继续关闭其他表
+			}
+		}
+	}
+	lsm.immutables = nil // 清空切片
 	for i := range lsm.immutables {
 		if err := lsm.immutables[i].close(); err != nil {
 			return err
