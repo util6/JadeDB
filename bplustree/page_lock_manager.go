@@ -34,19 +34,45 @@ import (
 	"github.com/util6/JadeDB/utils"
 )
 
-// LockType 定义锁类型
-type LockType uint8
+// PageLockType 页面级锁类型（用于B+树页面保护）
+type PageLockType uint8
 
 const (
-	// ReadLock 读锁（共享锁）
-	ReadLock LockType = iota
-	// WriteLock 写锁（排他锁）
-	WriteLock
-	// IntentionReadLock 意向读锁
-	IntentionReadLock
-	// IntentionWriteLock 意向写锁
-	IntentionWriteLock
+	// PageReadLock 页面读锁（共享锁）
+	PageReadLock PageLockType = iota
+	// PageWriteLock 页面写锁（排他锁）
+	PageWriteLock
+	// PageIntentionReadLock 页面意向读锁
+	PageIntentionReadLock
+	// PageIntentionWriteLock 页面意向写锁
+	PageIntentionWriteLock
 )
+
+// 向后兼容的类型别名
+type LockType = PageLockType
+
+const (
+	// 向后兼容的常量别名
+	ReadLock           = PageReadLock
+	WriteLock          = PageWriteLock
+	IntentionReadLock  = PageIntentionReadLock
+	IntentionWriteLock = PageIntentionWriteLock
+)
+
+func (plt PageLockType) String() string {
+	switch plt {
+	case PageReadLock:
+		return "PAGE_READ"
+	case PageWriteLock:
+		return "PAGE_WRITE"
+	case PageIntentionReadLock:
+		return "PAGE_INTENTION_READ"
+	case PageIntentionWriteLock:
+		return "PAGE_INTENTION_WRITE"
+	default:
+		return "PAGE_UNKNOWN"
+	}
+}
 
 // LockMode 定义锁模式
 type LockMode uint8

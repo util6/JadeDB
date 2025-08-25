@@ -34,6 +34,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/util6/JadeDB/common"
 )
 
 // 恢复常量
@@ -77,13 +79,14 @@ type TxnState struct {
 	UndoRecords []*LogRecord // 撤销记录
 }
 
-// TxnStatus 事务状态枚举
-type TxnStatus int
+// 注意：TxnStatus 已移至 common 包，使用 common.TransactionState 替代
+// 这里保留类型别名以保持兼容性
+type TxnStatus = common.TransactionState
 
 const (
-	TxnActive    TxnStatus = iota // 活跃状态
-	TxnCommitted                  // 已提交
-	TxnAborted                    // 已中止
+	TxnActive    = common.TxnActive    // 活跃状态
+	TxnCommitted = common.TxnCommitted // 已提交
+	TxnAborted   = common.TxnAborted   // 已中止
 )
 
 // RecoveryStats 恢复统计信息
