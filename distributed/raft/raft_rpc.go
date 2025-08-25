@@ -16,7 +16,7 @@ JadeDB Raft RPC接口定义
 - 错误处理：完整的错误处理和恢复
 */
 
-package distributed
+package raft
 
 import (
 	"context"

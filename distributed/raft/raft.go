@@ -18,7 +18,7 @@ Raft算法确保集群中所有节点的状态机保持一致，支持领导者�
 - 高性能：批量日志复制，流水线处理
 */
 
-package distributed
+package raft
 
 import (
 	"context"
@@ -152,6 +152,57 @@ type StateMachine interface {
 	Restore(snapshot []byte) error
 }
 
+// RaftConfig Raft配置
+type RaftConfig struct {
+	// 选举配置
+	ElectionTimeout  time.Duration // 选举超时时间
+	HeartbeatTimeout time.Duration // 心跳超时时间
+
+	// 日志配置
+	MaxLogEntries       int // 最大日志条目数
+	LogCompactThreshold int // 日志压缩阈值
+
+	// 快照配置
+	SnapshotThreshold int           // 快照阈值
+	SnapshotInterval  time.Duration // 快照间隔
+
+	// 网络配置
+	RequestTimeout time.Duration // 请求超时时间
+	MaxRetries     int           // 最大重试次数
+
+	// 性能配置
+	BatchSize      int // 批量大小
+	MaxConcurrency int // 最大并发数
+}
+
+// DefaultRaftConfig 默认Raft配置
+func DefaultRaftConfig() *RaftConfig {
+	return &RaftConfig{
+		ElectionTimeout:     150 * time.Millisecond,
+		HeartbeatTimeout:    50 * time.Millisecond,
+		MaxLogEntries:       10000,
+		LogCompactThreshold: 1000,
+		SnapshotThreshold:   1000,
+		SnapshotInterval:    time.Hour,
+		RequestTimeout:      5 * time.Second,
+		MaxRetries:          3,
+		BatchSize:           100,
+		MaxConcurrency:      10,
+	}
+}
+
+// DistributedConfig 分布式配置
+type DistributedConfig struct {
+	RaftConfig *RaftConfig
+}
+
+// DefaultDistributedConfig 默认分布式配置
+func DefaultDistributedConfig() *DistributedConfig {
+	return &DistributedConfig{
+		RaftConfig: DefaultRaftConfig(),
+	}
+}
+
 // ApplyMsg 应用消息
 type ApplyMsg struct {
 	CommandValid  bool
@@ -163,7 +214,7 @@ type ApplyMsg struct {
 	SnapshotIndex uint64
 }
 
-// NewRaftNode 创建Raft节点
+// NewRaftNode 创建Raft节点（完整版本）
 func NewRaftNode(nodeID string, peers []string, config *RaftConfig, stateMachine StateMachine, transport RaftTransport) *RaftNode {
 	if config == nil {
 		config = DefaultDistributedConfig().RaftConfig
@@ -717,6 +768,121 @@ func (rn *RaftNode) GetLeader() string {
 // GetTerm 获取当前任期
 func (rn *RaftNode) GetTerm() uint64 {
 	return rn.currentTerm.Load()
+}
+
+// GetState 获取当前状态（公开方法）
+func (rn *RaftNode) GetState() RaftState {
+	return rn.getState()
+}
+
+// AppendEntry 追加日志条目（用于测试）
+func (rn *RaftNode) AppendEntry(entry LogEntry) error {
+	return rn.Propose(entry.Data)
+}
+
+// GetLogLength 获取日志长度
+func (rn *RaftNode) GetLogLength() uint64 {
+	if rn.log == nil {
+		return 0
+	}
+	return rn.log.getLastIndex() + 1
+}
+
+// TakeSnapshot 创建快照（公开方法）
+func (rn *RaftNode) TakeSnapshot() error {
+	return rn.CreateSnapshot()
+}
+
+// GetLastSnapshotIndex 获取最后快照索引
+func (rn *RaftNode) GetLastSnapshotIndex() uint64 {
+	return rn.lastSnapshotIndex.Load()
+}
+
+// NewRaftNodeSimple 创建简化的Raft节点（用于测试）
+func NewRaftNodeSimple(nodeID string, config *RaftConfig, stateMachine StateMachine, storage interface{}) *RaftNode {
+	if config == nil {
+		config = DefaultRaftConfig()
+	}
+
+	// 创建模拟传输层
+	transport := NewMockRaftTransport()
+
+	node := &RaftNode{
+		nodeID:           nodeID,
+		peers:            make(map[string]*RaftPeer),
+		log:              NewRaftLog(),
+		nextIndex:        make(map[string]uint64),
+		matchIndex:       make(map[string]uint64),
+		electionTimeout:  config.ElectionTimeout,
+		heartbeatTimeout: config.HeartbeatTimeout,
+		stateMachine:     stateMachine,
+		applyCh:          make(chan ApplyMsg, 1000),
+		transport:        transport,
+		config:           config,
+		stopCh:           make(chan struct{}),
+		metrics:          NewRaftMetrics(),
+		logger:           log.New(log.Writer(), "[RAFT] ", log.LstdFlags),
+	}
+
+	// 初始化状态
+	node.state.Store(Follower)
+	node.currentTerm.Store(0)
+	node.votedFor.Store("")
+	node.leader.Store("")
+	node.lastHeartbeat.Store(time.Now())
+
+	// 初始化快照状态
+	node.lastSnapshotIndex.Store(0)
+	node.lastSnapshotTerm.Store(0)
+	node.snapshotThreshold = 1000
+
+	// 初始化生命周期管理
+	node.ctx, node.cancel = context.WithCancel(context.Background())
+
+	return node
+}
+
+// MockRaftTransport 模拟Raft传输层（用于测试）
+type MockRaftTransport struct{}
+
+// NewMockRaftTransport 创建模拟传输层
+func NewMockRaftTransport() RaftTransport {
+	return &MockRaftTransport{}
+}
+
+func (t *MockRaftTransport) GetClient(address string) RaftClient {
+	return &MockRaftClient{}
+}
+
+func (t *MockRaftTransport) StartServer(address string, handler RaftHandler) error {
+	return nil
+}
+
+func (t *MockRaftTransport) StopServer() error {
+	return nil
+}
+
+// MockRaftClient 模拟Raft客户端
+type MockRaftClient struct{}
+
+func (c *MockRaftClient) RequestVote(ctx context.Context, req *RequestVoteRequest) (*RequestVoteResponse, error) {
+	return &RequestVoteResponse{
+		Term:        req.Term,
+		VoteGranted: false,
+	}, nil
+}
+
+func (c *MockRaftClient) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResponse, error) {
+	return &AppendEntriesResponse{
+		Term:    req.Term,
+		Success: true,
+	}, nil
+}
+
+func (c *MockRaftClient) InstallSnapshot(ctx context.Context, req *InstallSnapshotRequest) (*InstallSnapshotResponse, error) {
+	return &InstallSnapshotResponse{
+		Term: req.Term,
+	}, nil
 }
 
 // CreateSnapshot 创建快照

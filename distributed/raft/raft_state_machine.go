@@ -19,7 +19,7 @@ JadeDB Raft状态机实现
 - 一致性：保证状态机在所有节点上的一致性
 */
 
-package distributed
+package raft
 
 import (
 	"bytes"
