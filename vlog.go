@@ -254,7 +254,7 @@ func (vlog *valueLog) open(db *DB, ptr *utils.ValuePtr, replayFn utils.LogEntry)
 	// head的设计起到check point的作用
 	vlog.db.vhead = &utils.ValuePtr{Fid: vlog.maxFid, Offset: uint32(lastOffset)}
 	if err := vlog.populateDiscardStats(); err != nil {
-		fmt.Errorf("Failed to populate discard stats: %s\n", err)
+		return fmt.Errorf("Failed to populate discard stats: %s", err)
 	}
 	return nil
 }
@@ -287,9 +287,8 @@ func (vlog *valueLog) read(vp *utils.ValuePtr) ([]byte, func(), error) {
 	headerLen := h.Decode(buf)
 	kv := buf[headerLen:]
 	if uint32(len(kv)) < h.KLen+h.VLen {
-		fmt.Errorf("Invalid read: vp: %+v\n", vp)
-		return nil, nil, errors.Errorf("Invalid read: Len: %d read at:[%d:%d]",
-			len(kv), h.KLen, h.KLen+h.VLen)
+		return nil, nil, errors.Errorf("Invalid read: vp: %+v, Len: %d read at:[%d:%d]",
+			vp, len(kv), h.KLen, h.KLen+h.VLen)
 	}
 	return kv[h.KLen : h.KLen+h.VLen], cb, nil
 }

@@ -236,6 +236,12 @@ func (lf *LogFile) EncodeEntry(entry interface{}, buf interface{}, offset uint32
 	return 0, nil
 }
 
+// DecodeEntry 解码条目
+func (lf *LogFile) DecodeEntry(buf []byte, offset uint32) (interface{}, error) {
+	// 简单实现，返回空接口
+	return nil, nil
+}
+
 // Lock 锁定文件
 func (lf *LogFile) Lock() {
 	lf.lock.Lock()
