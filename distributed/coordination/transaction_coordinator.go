@@ -19,7 +19,7 @@ JadeDB 分布式事务协调器
 - 可观测性：完整的事务状态跟踪和监控
 */
 
-package distributed
+package coordination
 
 import (
 	"context"
@@ -27,13 +27,15 @@ import (
 	"log"
 	"sync"
 	"time"
+
+	"github.com/util6/JadeDB/distributed/raft"
 )
 
 // TransactionCoordinator 分布式事务协调器
 type TransactionCoordinator struct {
 	// 基本信息
 	coordinatorID string
-	raftNode      *RaftNode
+	raftNode      *raft.RaftNode
 
 	// 事务管理
 	mu           sync.RWMutex
@@ -295,7 +297,7 @@ type CommitResult struct {
 }
 
 // NewTransactionCoordinator 创建事务协调器
-func NewTransactionCoordinator(coordinatorID string, raftNode *RaftNode, config *CoordinatorConfig) *TransactionCoordinator {
+func NewTransactionCoordinator(coordinatorID string, raftNode *raft.RaftNode, config *CoordinatorConfig) *TransactionCoordinator {
 	if config == nil {
 		config = DefaultCoordinatorConfig()
 	}
