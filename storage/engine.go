@@ -14,6 +14,7 @@ JadeDB 统一存储引擎接口
 package storage
 
 import (
+	"fmt"
 	"time"
 )
 
@@ -145,6 +146,14 @@ type EngineFactory interface {
 	ValidateConfig(engineType EngineType, config interface{}) error
 }
 
+// EngineCreator 引擎创建器接口
+type EngineCreator interface {
+	Create(config interface{}) (Engine, error)
+	GetEngineType() EngineType
+	GetDefaultConfig() interface{}
+	ValidateConfig(config interface{}) error
+}
+
 // BaseEngine 基础存储引擎实现
 // 提供通用的统计和状态管理功能
 type BaseEngine struct {
@@ -206,4 +215,26 @@ func (base *BaseEngine) UpdateStats(operation string, latency time.Duration) {
 		base.stats.ScanCount++
 		base.stats.AvgScanLatency = (base.stats.AvgScanLatency + latency) / 2
 	}
+}
+
+// 全局引擎创建器注册表
+var globalCreators = make(map[EngineType]EngineCreator)
+
+// RegisterEngineCreator 注册引擎创建器
+func RegisterEngineCreator(creator EngineCreator) error {
+	engineType := creator.GetEngineType()
+	if _, exists := globalCreators[engineType]; exists {
+		return fmt.Errorf("engine creator for type %v already registered", engineType)
+	}
+	globalCreators[engineType] = creator
+	return nil
+}
+
+// GetRegisteredCreators 获取所有已注册的创建器
+func GetRegisteredCreators() map[EngineType]EngineCreator {
+	result := make(map[EngineType]EngineCreator)
+	for k, v := range globalCreators {
+		result[k] = v
+	}
+	return result
 }
