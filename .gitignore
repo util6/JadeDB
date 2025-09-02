@@ -4,3 +4,6 @@ testdata
 .idea
 .specstory
 wal_*
+*.wal
+test_data
+.idea

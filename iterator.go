@@ -110,6 +110,19 @@ func (it *Item) Entry() *utils.Entry {
 // - 内存表访问速度最快，SSTable 按层级访问
 // - 值日志访问可能涉及磁盘 I/O，会影响遍历速度
 func (db *DB) NewIterator(opt *utils.Options) utils.Iterator {
+	// 根据引擎模式选择不同的实现
+	switch db.engineMode {
+	case LegacyMode:
+		return db.newIteratorLegacy(opt)
+	case AdapterMode:
+		return db.engineAdapter.NewIterator(opt)
+	default:
+		return nil
+	}
+}
+
+// newIteratorLegacy 传统模式的迭代器创建
+func (db *DB) newIteratorLegacy(opt *utils.Options) utils.Iterator {
 	// 收集所有数据源的迭代器
 	iters := make([]utils.Iterator, 0)
 	iters = append(iters, db.lsm.NewIterators(opt)...)
@@ -287,17 +300,27 @@ func (iter *DBIterator) Close() error {
 // 参数说明：
 // key: 目标键，迭代器将定位到大于等于此键的第一个位置
 //
-// 实现说明：
-// 当前实现为空，需要根据具体需求补充实现。
-// 典型的实现会调用底层迭代器的 Seek 方法。
+// 工作流程：
+// 1. 调用底层合并迭代器的 Seek 方法定位到目标键
+// 2. 跳过所有无效条目（已删除、过期或值为空）
+// 3. 定位到第一个有效的条目位置
 //
-// TODO: 实现 Seek 功能
-// - 调用底层合并迭代器的 Seek 方法
-// - 跳过无效条目定位到有效位置
-// - 处理边界情况和错误条件
+// 使用场景：
+// - 范围查询：从指定键开始遍历
+// - 定点查找：快速定位到特定键的位置
+// - 前缀搜索：结合前缀匹配实现高效搜索
+//
+// 性能考虑：
+// - 利用底层数据结构的有序性实现快速定位
+// - 跳过无效条目可能需要额外的迭代开销
+// - 比线性搜索更高效，时间复杂度通常为 O(log n)
 func (iter *DBIterator) Seek(key []byte) {
-	// TODO: 实现 Seek 功能
-	// iter.iitr.Seek(key)
-	// for ; iter.Valid() && iter.Item() == nil; iter.iitr.Next() {
-	// }
+	// 调用底层合并迭代器的 Seek 方法
+	iter.iitr.Seek(key)
+
+	// 跳过所有无效的条目（已删除、过期或值为空）
+	// 确保定位到第一个有效的条目位置
+	for iter.Valid() && iter.Item() == nil {
+		iter.iitr.Next()
+	}
 }

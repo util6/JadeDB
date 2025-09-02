@@ -398,8 +398,10 @@ func (vlog *valueLog) close() error {
 		maxFid := vlog.maxFid
 		if id == maxFid {
 			// truncate writable log file to correct offset.
-			if truncErr := f.Truncate(int64(vlog.woffset())); truncErr != nil && err == nil {
-				err = truncErr
+			if f.FD() != nil { // 检查底层文件是否存在
+				if truncErr := f.Truncate(int64(vlog.woffset())); truncErr != nil && err == nil {
+					err = truncErr
+				}
 			}
 		}
 		if closeErr := f.Close(); closeErr != nil && err == nil {
@@ -1199,6 +1201,9 @@ type request struct {
 }
 
 func (req *request) reset() {
+	// 释放所有Entry对象到对象池
+	putEntrySlice(req.Entries)
+
 	req.Entries = req.Entries[:0]
 	req.Ptrs = req.Ptrs[:0]
 	req.Wg = sync.WaitGroup{}

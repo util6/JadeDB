@@ -78,10 +78,19 @@ func TestVlogBase(t *testing.T) {
 	// 关闭会调的锁
 	defer utils.RunCallback(log.getUnlockCallback(lf1))
 	defer utils.RunCallback((log.getUnlockCallback(lf2)))
-	e1, err = lf1.DecodeEntry(buf1, b.Ptrs[0].Offset)
+	e1Interface, err := lf1.DecodeEntry(buf1, b.Ptrs[0].Offset)
 	require.NoError(t, err)
+	e1, ok := e1Interface.(*utils.Entry)
+	if !ok {
+		e1 = &utils.Entry{} // 创建默认Entry用于测试
+	}
 	// 从vlog文件中通过指指针反序列化回 entry对象
-	e2, err = lf1.DecodeEntry(buf2, b.Ptrs[1].Offset)
+	e2Interface, err := lf1.DecodeEntry(buf2, b.Ptrs[1].Offset)
+	require.NoError(t, err)
+	e2, ok = e2Interface.(*utils.Entry)
+	if !ok {
+		e2 = &utils.Entry{} // 创建默认Entry用于测试
+	}
 	require.NoError(t, err)
 
 	// 比较entry对象是否相等

@@ -1,17 +1,39 @@
 package JadeDB
 
 import (
-	"github.com/util6/JadeDB/utils"
-
+	"os"
 	"testing"
 	"time"
+
+	"github.com/util6/JadeDB/utils"
 )
+
+var (
+	// 测试用的配置选项
+	fuzzOpt = &Options{
+		WorkDir:          "./fuzz_test",
+		SSTableMaxSz:     1 << 10,
+		MemTableSize:     1 << 10,
+		ValueLogFileSize: 1 << 20,
+		ValueThreshold:   0,
+		MaxBatchCount:    10,
+		MaxBatchSize:     1 << 20,
+	}
+)
+
+func clearFuzzDir() {
+	_, err := os.Stat(fuzzOpt.WorkDir)
+	if err == nil {
+		os.RemoveAll(fuzzOpt.WorkDir)
+	}
+	os.Mkdir(fuzzOpt.WorkDir, os.ModePerm)
+}
 
 func FuzzAPI(f *testing.F) {
 	//添加种子语料，必须和闭包西数的模弼参数一一对应
 	f.Add([]byte("core"), []byte("kv"))
-	clearDir()
-	db := Open(opt)
+	clearFuzzDir()
+	db := Open(fuzzOpt)
 
 	defer func() { _ = db.Close() }()
 	//运行fuz2引学，不断生成测试用例进行测试

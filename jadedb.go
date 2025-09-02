@@ -43,15 +43,36 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/util6/JadeDB/bplustree"
 	"github.com/util6/JadeDB/lsm"
+	"github.com/util6/JadeDB/storage"
 	"github.com/util6/JadeDB/utils"
 
 	"github.com/pkg/errors"
 )
 
+var (
+	// entryPool Entry对象池，用于减少Entry对象的内存分配
+	entryPool = sync.Pool{
+		New: func() interface{} {
+			return &utils.Entry{}
+		},
+	}
+)
+
 // 类型别名，避免循环依赖
 type Options = lsm.Options
 type Stats = lsm.Stats
+
+// EngineMode 引擎模式
+type EngineMode int
+
+const (
+	// LegacyMode 传统模式，直接使用LSM引擎
+	LegacyMode EngineMode = iota
+	// AdapterMode 适配器模式，支持多引擎切换
+	AdapterMode
+)
 
 // oracle 时间戳分配器（简化实现）
 type oracle struct {
@@ -66,9 +87,58 @@ func newOracle() *oracle {
 	return &oracle{nextTs: 1}
 }
 
+// getEntry 从对象池获取Entry对象
+func getEntry() *utils.Entry {
+	return entryPool.Get().(*utils.Entry)
+}
+
+// putEntry 将Entry对象归还到对象池
+func putEntry(entry *utils.Entry) {
+	if entry == nil {
+		return
+	}
+
+	// 重置Entry对象的状态（保留底层数组容量）
+	if cap(entry.Key) > 0 {
+		entry.Key = entry.Key[:0]
+	} else {
+		entry.Key = nil
+	}
+
+	if cap(entry.Value) > 0 {
+		entry.Value = entry.Value[:0]
+	} else {
+		entry.Value = nil
+	}
+
+	entry.ExpiresAt = 0
+	entry.Meta = 0
+	entry.Version = 0
+	entry.Offset = 0
+	entry.Hlen = 0
+
+	// 归还到对象池
+	entryPool.Put(entry)
+}
+
+// getEntrySlice 从对象池获取Entry切片（复用request中的Entries）
+func getEntrySlice(capacity int) []*utils.Entry {
+	// 简化实现：直接创建切片
+	// 在更高级的实现中，可以考虑切片对象池
+	return make([]*utils.Entry, 0, capacity)
+}
+
+// putEntrySlice 释放Entry切片中的所有Entry对象
+func putEntrySlice(entries []*utils.Entry) {
+	for _, entry := range entries {
+		putEntry(entry)
+	}
+}
+
 // newStats 创建统计信息（简化实现）
 func newStats(opt *Options) *Stats {
-	return &Stats{}
+	// 使用LSM包中的NewStats函数
+	return lsm.NewStats(opt)
 }
 
 type (
@@ -117,6 +187,10 @@ type (
 		vlog  *valueLog // 值日志实例，负责大值的分离存储
 		stats *Stats    // 统计信息收集器，用于监控数据库性能
 
+		// 存储引擎适配器（新增）
+		engineAdapter *EngineAdapter // 引擎适配器，支持多引擎切换
+		engineMode    EngineMode     // 引擎模式：传统模式或适配器模式
+
 		// 并发控制和通信
 		flushChan   chan flushTask // 用于刷新内存表到磁盘的任务通道
 		writeCh     chan *request  // 写入请求通道，用于批量处理写操作
@@ -160,21 +234,48 @@ var (
 //
 // 注意：目前没有实现目录锁，可能需要添加以防止多个进程同时打开同一目录
 func Open(opt *Options) *DB {
+	return OpenWithEngine(opt, LegacyMode, LSMEngine)
+}
+
+// OpenWithEngine 使用指定引擎创建数据库实例
+func OpenWithEngine(opt *Options, mode EngineMode, engineType EngineType) *DB {
 	// 创建资源管理器，用于优雅关闭
 	c := utils.NewCloser()
 
 	// 创建数据库实例并设置基本配置
-	db := &DB{opt: opt}
+	db := &DB{
+		opt:        opt,
+		engineMode: mode,
+	}
 
+	// 根据引擎模式初始化
+	switch mode {
+	case LegacyMode:
+		// 传统模式：直接使用LSM引擎
+		db.initLegacyMode(c)
+	case AdapterMode:
+		// 适配器模式：支持多引擎切换
+		if err := db.initAdapterMode(engineType); err != nil {
+			panic(fmt.Sprintf("Failed to initialize adapter mode: %v", err))
+		}
+	default:
+		panic(fmt.Sprintf("Unsupported engine mode: %v", mode))
+	}
+
+	return db
+}
+
+// initLegacyMode 初始化传统模式
+func (db *DB) initLegacyMode(c *utils.Closer) {
 	// 初始化值日志组件
 	// 值日志用于存储大值，减少 LSM 树的写放大问题
 	db.initVLog()
 
 	// 初始化 LSM 树组件，配置各种参数
 	db.lsm = lsm.NewLSM(&lsm.Options{
-		WorkDir:             opt.WorkDir,                         // 工作目录
-		MemTableSize:        opt.MemTableSize,                    // 内存表大小
-		SSTableMaxSz:        opt.SSTableMaxSz,                    // SSTable 最大大小
+		WorkDir:             db.opt.WorkDir,                      // 工作目录
+		MemTableSize:        db.opt.MemTableSize,                 // 内存表大小
+		SSTableMaxSz:        db.opt.SSTableMaxSz,                 // SSTable 最大大小
 		BlockSize:           8 * 1024,                            // 块大小，固定为 8KB
 		BloomFalsePositive:  0,                                   // 布隆过滤器假阳性率，0 表示禁用
 		BaseLevelSize:       10 << 20,                            // 基础层大小，10MB
@@ -188,7 +289,7 @@ func Open(opt *Options) *DB {
 	})
 
 	// 初始化统计信息收集器
-	db.stats = newStats(opt)
+	db.stats = newStats(db.opt)
 
 	// 初始化性能优化组件
 	// 默认启用优化功能，包括异步处理和合并优化
@@ -214,8 +315,63 @@ func Open(opt *Options) *DB {
 
 	// 启动统计信息收集后台进程
 	go db.stats.StartStats()
+}
 
-	return db
+// initAdapterMode 初始化适配器模式
+func (db *DB) initAdapterMode(engineType EngineType) error {
+	// 创建适配器配置
+	adapterConfig := DefaultEngineAdapterConfig()
+	adapterConfig.DefaultEngineType = engineType
+	// 暂时禁用数据迁移，因为 LSM 迭代器还未实现
+	adapterConfig.EnableDataMigration = false
+
+	// 设置所有支持的引擎配置（适配器模式需要支持运行时切换）
+	// LSM 引擎配置
+	adapterConfig.EngineConfigs[LSMEngine] = &lsm.LSMEngineConfig{
+		LSMOptions: &lsm.Options{
+			WorkDir:             db.opt.WorkDir,
+			MemTableSize:        db.opt.MemTableSize,
+			SSTableMaxSz:        db.opt.SSTableMaxSz,
+			BlockSize:           8 * 1024,
+			BloomFalsePositive:  0,
+			BaseLevelSize:       10 << 20,
+			LevelSizeMultiplier: 10,
+			BaseTableSize:       5 << 20,
+			TableSizeMultiplier: 2,
+			NumLevelZeroTables:  15,
+			MaxLevelNum:         7,
+			NumCompactors:       1,
+		},
+	}
+
+	// B+ 树引擎配置
+	adapterConfig.EngineConfigs[BTreeEngine] = &bplustree.BTreeEngineConfig{
+		BTreeOptions: &bplustree.BTreeOptions{
+			WorkDir:            db.opt.WorkDir,
+			PageSize:           4096,
+			MaxFileSize:        1024 * 1024 * 1024, // 1GB
+			BufferPoolSize:     1024,               // 1024 pages
+			BufferPoolPolicy:   "LRU",
+			EnableAdaptiveHash: true,
+			EnablePrefetch:     true,
+			PrefetchSize:       8,
+			CheckpointInterval: 5 * time.Minute,  // 添加检查点间隔
+			WALBufferSize:      64 * 1024 * 1024, // 64MB WAL缓冲区
+		},
+	}
+
+	// 创建引擎适配器
+	adapter, err := NewEngineAdapter(adapterConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create engine adapter: %w", err)
+	}
+
+	db.engineAdapter = adapter
+
+	// 初始化统计信息收集器
+	db.stats = newStats(db.opt)
+
+	return nil
 }
 
 // Close 关闭数据库并释放所有相关资源。
@@ -225,6 +381,19 @@ func Open(opt *Options) *DB {
 // 返回值：
 // 如果任何组件关闭失败，返回第一个遇到的错误
 func (db *DB) Close() error {
+	// 根据引擎模式选择不同的关闭逻辑
+	switch db.engineMode {
+	case LegacyMode:
+		return db.closeLegacy()
+	case AdapterMode:
+		return db.engineAdapter.Close()
+	default:
+		return fmt.Errorf("unsupported engine mode: %v", db.engineMode)
+	}
+}
+
+// closeLegacy 传统模式的关闭逻辑
+func (db *DB) closeLegacy() error {
 	// 首先关闭值日志的丢弃统计收集器
 	db.vlog.lfDiscardStats.closer.Close()
 
@@ -260,12 +429,21 @@ func (db *DB) Close() error {
 // LSM 树的删除操作是通过写入墓碑标记来实现的，这样可以保证删除操作的高性能，
 // 真正的数据清理会在后续的压缩过程中进行。
 func (db *DB) Del(key []byte) error {
-	// 创建一个墓碑条目，值为 nil 表示删除
-	return db.Set(&utils.Entry{
-		Key:       key,
-		Value:     nil, // nil 值表示这是一个删除操作
-		ExpiresAt: 0,   // 不设置过期时间
-	})
+	// 根据引擎模式选择不同的实现
+	switch db.engineMode {
+	case LegacyMode:
+		// 创建一个墓碑条目，设置删除标记
+		return db.Set(&utils.Entry{
+			Key:       key,
+			Value:     nil,             // nil 值表示这是一个删除操作
+			Meta:      utils.BitDelete, // 设置删除标记
+			ExpiresAt: 0,               // 不设置过期时间
+		})
+	case AdapterMode:
+		return db.engineAdapter.Del(key)
+	default:
+		return fmt.Errorf("unsupported engine mode: %v", db.engineMode)
+	}
 }
 
 // Set 向数据库中存储一个键值对条目。
@@ -287,6 +465,19 @@ func (db *DB) Set(data *utils.Entry) error {
 		return utils.ErrEmptyKey
 	}
 
+	// 根据引擎模式选择不同的实现
+	switch db.engineMode {
+	case LegacyMode:
+		return db.setLegacy(data)
+	case AdapterMode:
+		return db.engineAdapter.Set(data)
+	default:
+		return fmt.Errorf("unsupported engine mode: %v", db.engineMode)
+	}
+}
+
+// setLegacy 传统模式的Set实现
+func (db *DB) setLegacy(data *utils.Entry) error {
 	// 声明变量用于值指针处理
 	var (
 		vp  *utils.ValuePtr // 值指针，用于大值存储
@@ -340,6 +531,19 @@ func (db *DB) Get(key []byte) (*utils.Entry, error) {
 		return nil, utils.ErrEmptyKey
 	}
 
+	// 根据引擎模式选择不同的实现
+	switch db.engineMode {
+	case LegacyMode:
+		return db.getLegacy(key)
+	case AdapterMode:
+		return db.engineAdapter.Get(key)
+	default:
+		return nil, fmt.Errorf("unsupported engine mode: %v", db.engineMode)
+	}
+}
+
+// getLegacy 传统模式的Get实现
+func (db *DB) getLegacy(key []byte) (*utils.Entry, error) {
 	// 保存原始键，用于最终返回
 	originKey := key
 	var (
@@ -485,7 +689,7 @@ func (db *DB) sendToWriteCh(entries []*utils.Entry) (*request, error) {
 		return nil, utils.ErrTxnTooBig
 	}
 
-	// TODO 尝试使用对象复用，后面entry对象也应该使用
+	// 使用对象复用减少内存分配（Entry对象池已实现）
 	req := requestPool.Get().(*request)
 	req.reset()
 	req.Entries = entries
@@ -684,4 +888,74 @@ func (db *DB) pushHead(ft flushTask) error {
 // IsClosed 检查数据库是否已关闭
 func (db *DB) IsClosed() bool {
 	return atomic.LoadInt32(&db.isClosed) != 0
+}
+
+// SwitchEngine 切换存储引擎（仅在适配器模式下可用）
+func (db *DB) SwitchEngine(targetType EngineType) error {
+	if db.engineMode != AdapterMode {
+		return fmt.Errorf("engine switching is only available in adapter mode")
+	}
+
+	return db.engineAdapter.SwitchEngine(targetType)
+}
+
+// GetCurrentEngineType 获取当前使用的引擎类型
+func (db *DB) GetCurrentEngineType() EngineType {
+	switch db.engineMode {
+	case LegacyMode:
+		return LSMEngine // 传统模式固定使用LSM引擎
+	case AdapterMode:
+		return db.engineAdapter.GetCurrentEngineType()
+	default:
+		return LSMEngine // 默认返回LSM引擎
+	}
+}
+
+// GetEngineMode 获取当前引擎模式
+func (db *DB) GetEngineMode() EngineMode {
+	return db.engineMode
+}
+
+// GetEngineStats 获取引擎统计信息
+func (db *DB) GetEngineStats() map[string]interface{} {
+	switch db.engineMode {
+	case LegacyMode:
+		// 传统模式返回LSM统计信息
+		stats := make(map[string]interface{})
+		stats["engine_type"] = "LSM"
+		stats["engine_mode"] = "Legacy"
+		if db.lsm != nil {
+			// 添加LSM特定统计信息
+			stats["lsm_stats"] = "available" // 这里可以添加具体的LSM统计
+		}
+		return stats
+	case AdapterMode:
+		// 适配器模式返回适配器统计信息
+		adapterStats := db.engineAdapter.GetAdapterStats()
+		result := make(map[string]interface{})
+		result["engine_mode"] = "Adapter"
+		result["current_engine"] = db.engineAdapter.GetCurrentEngineType().String()
+		result["switch_count"] = adapterStats.SwitchCount
+		result["total_operations"] = adapterStats.TotalOperations
+		result["successful_ops"] = adapterStats.SuccessfulOps
+		result["failed_ops"] = adapterStats.FailedOps
+		result["avg_latency"] = adapterStats.AvgLatency.String()
+		return result
+	default:
+		return map[string]interface{}{
+			"error": "unsupported engine mode",
+		}
+	}
+}
+
+// ListAvailableEngines 列出可用的存储引擎
+func (db *DB) ListAvailableEngines() []EngineType {
+	factory := GetGlobalEngineFactory()
+	return factory.GetSupportedTypes()
+}
+
+// GetEngineInfo 获取指定引擎的信息
+func (db *DB) GetEngineInfo(engineType EngineType) (*storage.EngineInfo, error) {
+	factory := GetGlobalEngineFactory()
+	return factory.GetEngineInfo(engineType)
 }
