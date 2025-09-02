@@ -360,22 +360,93 @@ func (ahi *AdaptiveHashIndex) evictLRU(partition *HashPartition) {
 }
 
 // cleanupCounters 清理访问计数器
+// 实现智能的清理策略，基于访问频率和时间进行清理
 func (ahi *AdaptiveHashIndex) cleanupCounters() {
-	// 简单实现：清理一半最旧的计数器
-	// TODO: 实现更智能的清理策略
-	toDelete := len(ahi.accessCounter.counters) / 2
+	ahi.accessCounter.mutex.Lock()
+	defer ahi.accessCounter.mutex.Unlock()
+
+	now := time.Now()
+	totalCounters := len(ahi.accessCounter.counters)
+
+	// 如果计数器数量不多，不需要清理
+	if totalCounters < 1000 {
+		return
+	}
+
+	// 智能清理策略：
+	// 1. 优先清理长时间未访问的计数器
+	// 2. 清理访问频率低的计数器
+	// 3. 保留热点数据的计数器
+
+	type counterInfo struct {
+		key     string
+		counter *KeyCounter
+		score   float64 // 清理优先级分数，分数越高越应该被清理
+	}
+
+	var candidates []counterInfo
+
+	// 计算每个计数器的清理优先级分数
+	for key, counter := range ahi.accessCounter.counters {
+		timeSinceLastAccess := now.Sub(counter.LastAccess)
+
+		// 分数计算：时间权重 + 频率权重
+		timeScore := float64(timeSinceLastAccess.Hours()) // 时间越长分数越高
+		freqScore := 1.0 / float64(counter.Count+1)       // 访问次数越少分数越高
+
+		score := timeScore*0.7 + freqScore*0.3 // 时间权重更高
+
+		candidates = append(candidates, counterInfo{
+			key:     key,
+			counter: counter,
+			score:   score,
+		})
+	}
+
+	// 按分数排序，分数高的优先清理
+	for i := 0; i < len(candidates)-1; i++ {
+		for j := i + 1; j < len(candidates); j++ {
+			if candidates[i].score < candidates[j].score {
+				candidates[i], candidates[j] = candidates[j], candidates[i]
+			}
+		}
+	}
+
+	// 清理策略：
+	// - 如果计数器数量 > 5000，清理40%
+	// - 如果计数器数量 > 2000，清理30%
+	// - 否则清理20%
+	var cleanupRatio float64
+	if totalCounters > 5000 {
+		cleanupRatio = 0.4
+	} else if totalCounters > 2000 {
+		cleanupRatio = 0.3
+	} else {
+		cleanupRatio = 0.2
+	}
+
+	toDelete := int(float64(totalCounters) * cleanupRatio)
 	deleted := 0
 
-	for key, counter := range ahi.accessCounter.counters {
+	// 执行清理
+	for _, candidate := range candidates {
 		if deleted >= toDelete {
 			break
 		}
 
-		// 删除超过1小时未访问的计数器
-		if time.Since(counter.LastAccess) > time.Hour {
-			delete(ahi.accessCounter.counters, key)
-			deleted++
+		// 额外保护：不清理最近5分钟内访问过的热点数据
+		if now.Sub(candidate.counter.LastAccess) < 5*time.Minute && candidate.counter.Count > 10 {
+			continue
 		}
+
+		delete(ahi.accessCounter.counters, candidate.key)
+		deleted++
+	}
+
+	// 记录清理统计
+	if deleted > 0 {
+		// 可以添加日志记录清理情况
+		// log.Printf("Cleaned up %d access counters, remaining: %d", deleted, len(ahi.accessCounter.counters))
 	}
 }
 

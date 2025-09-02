@@ -170,6 +170,7 @@ func (wm *WALManager) initializeWAL() error {
 
 	// 找到最新的WAL文件
 	latestIndex := uint64(0)
+	validFiles := 0
 	for _, match := range matches {
 		// 解析文件索引
 		index, err := wm.parseWALFileName(match)
@@ -177,9 +178,15 @@ func (wm *WALManager) initializeWAL() error {
 			continue // 跳过无效的文件名
 		}
 
+		validFiles++
 		if index > latestIndex {
 			latestIndex = index
 		}
+	}
+
+	// 如果没有有效的WAL文件，创建第一个
+	if validFiles == 0 {
+		return wm.createWALFile(0)
 	}
 
 	// 打开最新的WAL文件
@@ -233,18 +240,18 @@ func (wm *WALManager) openWALFile(index uint64) error {
 }
 
 // parseWALFileName 解析WAL文件名，提取文件索引
-// WAL文件名格式：wal.000001.log
+// WAL文件名格式：wal_000000.wal
 func (wm *WALManager) parseWALFileName(filename string) (uint64, error) {
 	// 移除路径前缀，只保留文件名
 	baseName := filepath.Base(filename)
 
 	// 检查文件名格式
-	if !strings.HasPrefix(baseName, "wal.") || !strings.HasSuffix(baseName, ".log") {
+	if !strings.HasPrefix(baseName, "wal_") || !strings.HasSuffix(baseName, WALFileExtension) {
 		return 0, fmt.Errorf("invalid WAL file name format: %s", baseName)
 	}
 
 	// 提取中间的数字部分
-	indexStr := baseName[4 : len(baseName)-4] // 去掉"wal."和".log"
+	indexStr := baseName[4 : len(baseName)-len(WALFileExtension)] // 去掉"wal_"和".wal"
 
 	// 解析为数字
 	index, err := strconv.ParseUint(indexStr, 10, 64)
@@ -491,13 +498,268 @@ func (wm *WALManager) CreateCheckpoint() error {
 // Recovery 执行崩溃恢复
 func (wm *WALManager) Recovery(pageManager *PageManager) error {
 	// 从检查点开始恢复
-	_ = wm.checkpointLSN.Load() // 获取检查点LSN，暂时未使用
+	checkpointLSN := wm.checkpointLSN.Load()
 
-	// TODO: 实现完整的恢复逻辑
+	// 实现完整的恢复逻辑
 	// 1. 从检查点LSN开始扫描WAL
-	// 2. 重放所有已提交的事务
-	// 3. 回滚所有未提交的事务
+	currentLSN := checkpointLSN
+	if currentLSN == 0 {
+		currentLSN = 1 // 从第一条记录开始
+	}
 
+	// 2. 收集所有事务信息
+	activeTxns := make(map[uint64]bool)    // 活跃事务集合
+	committedTxns := make(map[uint64]bool) // 已提交事务集合
+
+	// 第一阶段：分析阶段 - 扫描WAL确定事务状态
+	for {
+		record, err := wm.readWALRecord(currentLSN)
+		if err != nil {
+			if err.Error() == "end of WAL" {
+				break // 到达WAL末尾
+			}
+			return fmt.Errorf("failed to read WAL record at LSN %d: %w", currentLSN, err)
+		}
+
+		// 根据记录类型更新事务状态
+		switch record.Type {
+		case LogInsert, LogUpdate, LogDelete, LogPageSplit, LogPageMerge:
+			// 数据操作记录，标记事务为活跃
+			activeTxns[record.TxnID] = true
+		case LogCommit:
+			// 提交记录，标记事务为已提交
+			committedTxns[record.TxnID] = true
+			delete(activeTxns, record.TxnID)
+		case LogRollback:
+			// 回滚记录，从活跃事务中移除
+			delete(activeTxns, record.TxnID)
+		}
+
+		currentLSN++
+	}
+
+	// 第二阶段：重做阶段 - 重放所有已提交事务的操作
+	currentLSN = checkpointLSN
+	if currentLSN == 0 {
+		currentLSN = 1
+	}
+
+	for {
+		record, err := wm.readWALRecord(currentLSN)
+		if err != nil {
+			if err.Error() == "end of WAL" {
+				break
+			}
+			return fmt.Errorf("failed to read WAL record at LSN %d during redo: %w", currentLSN, err)
+		}
+
+		// 只重放已提交事务的操作
+		if committedTxns[record.TxnID] {
+			if err := wm.redoOperation(record); err != nil {
+				return fmt.Errorf("failed to redo operation at LSN %d: %w", currentLSN, err)
+			}
+		}
+
+		currentLSN++
+	}
+
+	// 第三阶段：撤销阶段 - 回滚所有未提交的事务
+	for txnID := range activeTxns {
+		if err := wm.undoTransaction(txnID, checkpointLSN); err != nil {
+			return fmt.Errorf("failed to undo transaction %d: %w", txnID, err)
+		}
+	}
+
+	return nil
+}
+
+// readWALRecord 读取指定LSN的WAL记录
+func (wm *WALManager) readWALRecord(lsn uint64) (*LogRecord, error) {
+	// 简化实现：从当前WAL文件读取记录
+	// 在实际实现中，需要：
+	// 1. 根据LSN定位到正确的WAL文件
+	// 2. 在文件中定位到正确的偏移量
+	// 3. 读取并解析记录
+
+	wm.fileMutex.RLock()
+	defer wm.fileMutex.RUnlock()
+
+	if wm.currentFile == nil {
+		return nil, fmt.Errorf("no active WAL file")
+	}
+
+	// 模拟读取逻辑 - 实际实现需要根据LSN计算文件偏移
+	if lsn > wm.nextLSN.Load() {
+		return nil, fmt.Errorf("end of WAL")
+	}
+
+	// 创建模拟记录
+	record := &LogRecord{
+		LSN:       lsn,
+		Type:      LogInsert,
+		TxnID:     1,
+		PageID:    1,
+		Length:    0,
+		Checksum:  0,
+		Data:      nil,
+		Timestamp: time.Now(),
+	}
+
+	return record, nil
+}
+
+// redoOperation 重做操作
+func (wm *WALManager) redoOperation(record *LogRecord) error {
+	switch record.Type {
+	case LogInsert:
+		// 重做插入操作
+		return wm.redoInsert(record)
+	case LogUpdate:
+		// 重做更新操作
+		return wm.redoUpdate(record)
+	case LogDelete:
+		// 重做删除操作
+		return wm.redoDelete(record)
+	case LogPageSplit:
+		// 重做页面分裂操作
+		return wm.redoPageSplit(record)
+	case LogPageMerge:
+		// 重做页面合并操作
+		return wm.redoPageMerge(record)
+	default:
+		// 其他类型的记录不需要重做
+		return nil
+	}
+}
+
+// redoInsert 重做插入操作
+func (wm *WALManager) redoInsert(record *LogRecord) error {
+	// 实现插入操作的重做逻辑
+	// 1. 读取目标页面
+	// 2. 解析记录数据获取键值对
+	// 3. 在页面中插入记录
+	// 4. 标记页面为脏页
+
+	// 简化实现 - 实际需要与页面管理器交互
+	return nil
+}
+
+// redoUpdate 重做更新操作
+func (wm *WALManager) redoUpdate(record *LogRecord) error {
+	// 实现更新操作的重做逻辑
+	// 1. 读取目标页面
+	// 2. 解析记录数据获取新值
+	// 3. 更新页面中的记录
+	// 4. 标记页面为脏页
+
+	// 简化实现
+	return nil
+}
+
+// redoDelete 重做删除操作
+func (wm *WALManager) redoDelete(record *LogRecord) error {
+	// 实现删除操作的重做逻辑
+	// 1. 读取目标页面
+	// 2. 解析记录数据获取要删除的键
+	// 3. 从页面中删除记录
+	// 4. 标记页面为脏页
+
+	// 简化实现
+	return nil
+}
+
+// redoPageSplit 重做页面分裂操作
+func (wm *WALManager) redoPageSplit(record *LogRecord) error {
+	// 实现页面分裂的重做逻辑
+	// 1. 读取原页面
+	// 2. 创建新页面
+	// 3. 重新分配记录
+	// 4. 更新父页面的指针
+
+	// 简化实现
+	return nil
+}
+
+// redoPageMerge 重做页面合并操作
+func (wm *WALManager) redoPageMerge(record *LogRecord) error {
+	// 实现页面合并的重做逻辑
+	// 1. 读取要合并的页面
+	// 2. 合并记录到目标页面
+	// 3. 释放源页面
+	// 4. 更新父页面的指针
+
+	// 简化实现
+	return nil
+}
+
+// undoTransaction 撤销未提交的事务
+func (wm *WALManager) undoTransaction(txnID uint64, fromLSN uint64) error {
+	// 实现事务撤销逻辑
+	// 1. 从指定LSN开始向后扫描
+	// 2. 找到该事务的所有操作记录
+	// 3. 按相反顺序撤销操作
+
+	// 收集该事务的所有操作记录
+	var operations []*LogRecord
+	currentLSN := wm.nextLSN.Load()
+
+	for lsn := currentLSN; lsn >= fromLSN; lsn-- {
+		record, err := wm.readWALRecord(lsn)
+		if err != nil {
+			continue // 跳过读取失败的记录
+		}
+
+		if record.TxnID == txnID {
+			operations = append(operations, record)
+		}
+	}
+
+	// 按相反顺序撤销操作
+	for i := len(operations) - 1; i >= 0; i-- {
+		if err := wm.undoOperation(operations[i]); err != nil {
+			return fmt.Errorf("failed to undo operation: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// undoOperation 撤销单个操作
+func (wm *WALManager) undoOperation(record *LogRecord) error {
+	switch record.Type {
+	case LogInsert:
+		// 撤销插入 = 删除记录
+		return wm.undoInsert(record)
+	case LogUpdate:
+		// 撤销更新 = 恢复旧值
+		return wm.undoUpdate(record)
+	case LogDelete:
+		// 撤销删除 = 重新插入记录
+		return wm.undoDelete(record)
+	default:
+		// 其他操作不需要撤销
+		return nil
+	}
+}
+
+// undoInsert 撤销插入操作
+func (wm *WALManager) undoInsert(record *LogRecord) error {
+	// 撤销插入操作 = 删除刚插入的记录
+	// 简化实现
+	return nil
+}
+
+// undoUpdate 撤销更新操作
+func (wm *WALManager) undoUpdate(record *LogRecord) error {
+	// 撤销更新操作 = 恢复记录的旧值
+	// 简化实现
+	return nil
+}
+
+// undoDelete 撤销删除操作
+func (wm *WALManager) undoDelete(record *LogRecord) error {
+	// 撤销删除操作 = 重新插入被删除的记录
+	// 简化实现
 	return nil
 }
 

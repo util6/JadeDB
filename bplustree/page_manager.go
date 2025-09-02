@@ -28,6 +28,7 @@ JadeDB B+树页面管理器模块
 package bplustree
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -197,18 +198,148 @@ func (pm *PageManager) saveMetadata(filename string) error {
 func (pm *PageManager) serializeMetadata() []byte {
 	data := make([]byte, PageSize)
 
-	// 这里应该实现元数据的序列化
-	// 为了简化，暂时返回空数据
-	// TODO: 实现完整的序列化逻辑
+	pm.metaMutex.RLock()
+	defer pm.metaMutex.RUnlock()
+
+	if pm.metaPage == nil {
+		// 如果元数据页面为空，创建默认的元数据
+		pm.metaPage = &BTreeMetaPage{
+			Version:     1,
+			Magic:       0xB7EE, // B+Tree魔数
+			RootPageID:  0,
+			TreeHeight:  0,
+			PageCount:   uint64(pm.totalPages.Load()),
+			FreePageID:  0,
+			FreeCount:   uint64(pm.freeCount.Load()),
+			NextPageID:  pm.nextPageID.Load(),
+			FileCount:   uint32(pm.fileCount),
+			PageSize:    PageSize,
+			RecordCount: 0,
+			LastLSN:     0,
+		}
+	}
+
+	// 序列化元数据到字节数组
+	offset := 0
+
+	// 版本信息 (8字节)
+	binary.LittleEndian.PutUint32(data[offset:], pm.metaPage.Version)
+	offset += 4
+	binary.LittleEndian.PutUint32(data[offset:], pm.metaPage.Magic)
+	offset += 4
+
+	// 树结构信息 (16字节)
+	binary.LittleEndian.PutUint64(data[offset:], pm.metaPage.RootPageID)
+	offset += 8
+	binary.LittleEndian.PutUint32(data[offset:], pm.metaPage.TreeHeight)
+	offset += 4
+	binary.LittleEndian.PutUint32(data[offset:], 0) // 填充对齐
+	offset += 4
+
+	// 页面统计 (8字节)
+	binary.LittleEndian.PutUint64(data[offset:], pm.metaPage.PageCount)
+	offset += 8
+
+	// 空间管理 (24字节)
+	binary.LittleEndian.PutUint64(data[offset:], pm.metaPage.FreePageID)
+	offset += 8
+	binary.LittleEndian.PutUint64(data[offset:], pm.metaPage.FreeCount)
+	offset += 8
+	binary.LittleEndian.PutUint64(data[offset:], pm.metaPage.NextPageID)
+	offset += 8
+
+	// 文件信息 (8字节)
+	binary.LittleEndian.PutUint32(data[offset:], pm.metaPage.FileCount)
+	offset += 4
+	binary.LittleEndian.PutUint32(data[offset:], pm.metaPage.PageSize)
+	offset += 4
+
+	// 统计信息 (16字节)
+	binary.LittleEndian.PutUint64(data[offset:], pm.metaPage.RecordCount)
+	offset += 8
+	binary.LittleEndian.PutUint64(data[offset:], pm.metaPage.LastLSN)
+	offset += 8
+
+	// 计算校验和 (4字节)
+	checksum := uint32(utils.CalculateChecksum(data[:offset]))
+	binary.LittleEndian.PutUint32(data[offset:], checksum)
+	pm.metaPage.Checksum = checksum
 
 	return data
 }
 
 // deserializeMetadata 反序列化元数据
 func (pm *PageManager) deserializeMetadata(data []byte) error {
-	// 这里应该实现元数据的反序列化
-	// 为了简化，暂时不做处理
-	// TODO: 实现完整的反序列化逻辑
+	if len(data) < PageSize {
+		return fmt.Errorf("invalid metadata size: %d", len(data))
+	}
+
+	pm.metaMutex.Lock()
+	defer pm.metaMutex.Unlock()
+
+	// 创建元数据页面对象
+	pm.metaPage = &BTreeMetaPage{}
+
+	offset := 0
+
+	// 版本信息 (8字节)
+	pm.metaPage.Version = binary.LittleEndian.Uint32(data[offset:])
+	offset += 4
+	pm.metaPage.Magic = binary.LittleEndian.Uint32(data[offset:])
+	offset += 4
+
+	// 验证魔数
+	if pm.metaPage.Magic != 0xB7EE {
+		return fmt.Errorf("invalid magic number: 0x%X", pm.metaPage.Magic)
+	}
+
+	// 树结构信息 (16字节)
+	pm.metaPage.RootPageID = binary.LittleEndian.Uint64(data[offset:])
+	offset += 8
+	pm.metaPage.TreeHeight = binary.LittleEndian.Uint32(data[offset:])
+	offset += 4
+	offset += 4 // 跳过填充字节
+
+	// 页面统计 (8字节)
+	pm.metaPage.PageCount = binary.LittleEndian.Uint64(data[offset:])
+	offset += 8
+
+	// 空间管理 (24字节)
+	pm.metaPage.FreePageID = binary.LittleEndian.Uint64(data[offset:])
+	offset += 8
+	pm.metaPage.FreeCount = binary.LittleEndian.Uint64(data[offset:])
+	offset += 8
+	pm.metaPage.NextPageID = binary.LittleEndian.Uint64(data[offset:])
+	offset += 8
+
+	// 文件信息 (8字节)
+	pm.metaPage.FileCount = binary.LittleEndian.Uint32(data[offset:])
+	offset += 4
+	pm.metaPage.PageSize = binary.LittleEndian.Uint32(data[offset:])
+	offset += 4
+
+	// 统计信息 (16字节)
+	pm.metaPage.RecordCount = binary.LittleEndian.Uint64(data[offset:])
+	offset += 8
+	pm.metaPage.LastLSN = binary.LittleEndian.Uint64(data[offset:])
+	offset += 8
+
+	// 校验和验证 (4字节)
+	storedChecksum := binary.LittleEndian.Uint32(data[offset:])
+	calculatedChecksum := uint32(utils.CalculateChecksum(data[:offset]))
+
+	if storedChecksum != calculatedChecksum {
+		return fmt.Errorf("metadata checksum mismatch: stored=0x%X, calculated=0x%X",
+			storedChecksum, calculatedChecksum)
+	}
+
+	pm.metaPage.Checksum = storedChecksum
+
+	// 恢复内部状态
+	pm.nextPageID.Store(pm.metaPage.NextPageID)
+	pm.totalPages.Store(int64(pm.metaPage.PageCount))
+	pm.freeCount.Store(int64(pm.metaPage.FreeCount))
+	pm.fileCount = int(pm.metaPage.FileCount)
 
 	return nil
 }

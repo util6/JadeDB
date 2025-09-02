@@ -15,6 +15,7 @@ package bplustree
 
 import (
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -119,6 +120,11 @@ func (engine *BTreeEngine) Open() error {
 
 	if engine.IsOpened() {
 		return fmt.Errorf("B+Tree engine already opened")
+	}
+
+	// 确保工作目录存在
+	if err := os.MkdirAll(engine.config.BTreeOptions.WorkDir, 0755); err != nil {
+		return fmt.Errorf("failed to create work directory: %w", err)
 	}
 
 	// 创建B+树实例
