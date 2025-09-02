@@ -236,6 +236,12 @@ func (m *memTable) Get(key []byte) (*utils.Entry, error) {
 	// 跳表的搜索操作是 O(log n) 时间复杂度
 	vs := m.sl.Search(key)
 
+	// 检查是否找到了键
+	if len(vs.Value) == 0 && vs.Meta == 0 && vs.ExpiresAt == 0 && vs.Version == 0 {
+		// 键不存在
+		return nil, nil
+	}
+
 	// 将值结构转换为完整的条目格式
 	e := &utils.Entry{
 		Key:       key,          // 查询的键

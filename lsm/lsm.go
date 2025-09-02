@@ -247,12 +247,20 @@ func (lsm *LSM) Get(key []byte) (*utils.Entry, error) {
 		err   error
 	)
 	// 从内存表中查询,先查活跃表，在查不变表
-	if entry, err = lsm.memTable.Get(key); entry != nil && entry.Value != nil {
+	if entry, err = lsm.memTable.Get(key); entry != nil {
+		if entry.Value == nil {
+			// 找到墓碑标记，表示键已被删除
+			return nil, fmt.Errorf("key not found")
+		}
 		return entry, err
 	}
 
 	for i := len(lsm.immutables) - 1; i >= 0; i-- {
-		if entry, err = lsm.immutables[i].Get(key); entry != nil && entry.Value != nil {
+		if entry, err = lsm.immutables[i].Get(key); entry != nil {
+			if entry.Value == nil {
+				// 找到墓碑标记，表示键已被删除
+				return nil, fmt.Errorf("key not found")
+			}
 			return entry, err
 		}
 	}

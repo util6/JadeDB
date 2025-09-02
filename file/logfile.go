@@ -43,8 +43,13 @@ LogFile 是 JadeDB 中用于管理日志文件的核心组件，主要用于值�
 package file
 
 import (
+	"bytes"
+	"fmt"
+	"hash/crc32"
 	"os"
 	"sync"
+
+	"github.com/util6/JadeDB/utils"
 )
 
 // LogFile 表示一个日志文件，主要用于值日志的实现。
@@ -150,11 +155,17 @@ func NewLogFile(path string, fid uint64, loadingMode int) (*LogFile, error) {
 
 // FD 返回文件描述符
 func (lf *LogFile) FD() *os.File {
+	if lf.f == nil {
+		return nil
+	}
 	return lf.f.Fd
 }
 
 // Close 关闭日志文件
 func (lf *LogFile) Close() error {
+	if lf.f == nil {
+		return nil
+	}
 	return lf.f.Close()
 }
 
@@ -190,13 +201,53 @@ func (lf *LogFile) Read(offset, size int) ([]byte, error) {
 
 // ReadValuePtr 根据 ValuePtr 读取数据
 func (lf *LogFile) ReadValuePtr(vp interface{}) ([]byte, error) {
-	// 简单实现，返回空字节
-	return []byte{}, nil
+	// 检查文件是否已打开
+	if lf.f == nil {
+		return nil, fmt.Errorf("log file not opened")
+	}
+
+	// 类型断言，获取utils.ValuePtr
+	valuePtr, ok := vp.(*utils.ValuePtr)
+	if !ok {
+		return nil, fmt.Errorf("invalid value pointer type: %T, expected *utils.ValuePtr", vp)
+	}
+
+	// 检查偏移量是否有效
+	if valuePtr.Offset >= uint32(len(lf.f.Data)) {
+		return nil, fmt.Errorf("offset %d exceeds file size %d", valuePtr.Offset, len(lf.f.Data))
+	}
+
+	// 检查长度是否有效
+	if valuePtr.Offset+valuePtr.Len > uint32(len(lf.f.Data)) {
+		return nil, fmt.Errorf("read range [%d:%d] exceeds file size %d",
+			valuePtr.Offset, valuePtr.Offset+valuePtr.Len, len(lf.f.Data))
+	}
+
+	// 从内存映射文件中读取数据
+	data := make([]byte, valuePtr.Len)
+	copy(data, lf.f.Data[valuePtr.Offset:valuePtr.Offset+valuePtr.Len])
+
+	return data, nil
 }
 
 // Open 打开日志文件
 func (lf *LogFile) Open(opt *Options) error {
-	// 文件已经在 NewLogFile 中打开了
+	// 如果文件已经打开，直接返回
+	if lf.f != nil {
+		return nil
+	}
+
+	// 使用NewLogFile来打开文件
+	var err error
+	lf.f, err = OpenMmapFile(opt.FileName, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open mmap file %s: %w", opt.FileName, err)
+	}
+
+	// 设置文件标识符
+	lf.FID = opt.FID
+	lf.fid = opt.FID
+
 	return nil
 }
 
@@ -232,8 +283,54 @@ func (lf *LogFile) DoneWriting(offset uint32) error {
 
 // EncodeEntry 编码条目
 func (lf *LogFile) EncodeEntry(entry interface{}, buf interface{}, offset uint32) (uint32, error) {
-	// 简单实现，返回固定长度
-	return 0, nil
+	// 类型断言获取Entry和Buffer
+	e, ok := entry.(*utils.Entry)
+	if !ok {
+		return 0, fmt.Errorf("invalid entry type: %T, expected *utils.Entry", entry)
+	}
+
+	buffer, ok := buf.(*bytes.Buffer)
+	if !ok {
+		return 0, fmt.Errorf("invalid buffer type: %T, expected *bytes.Buffer", buf)
+	}
+
+	// 记录写入前的位置
+	startPos := buffer.Len()
+
+	// 创建Header
+	h := utils.Header{
+		KLen:      uint32(len(e.Key)),
+		VLen:      uint32(len(e.Value)),
+		ExpiresAt: e.ExpiresAt,
+		Meta:      e.Meta,
+	}
+
+	// 编码Header
+	headerBuf := make([]byte, utils.MaxHeaderSize)
+	headerLen := h.Encode(headerBuf)
+	buffer.Write(headerBuf[:headerLen])
+
+	// 写入Key
+	buffer.Write(e.Key)
+
+	// 写入Value
+	buffer.Write(e.Value)
+
+	// 如果启用了校验和，添加CRC32校验和
+	if lf.f != nil { // 简单检查，实际应该检查配置
+		hash := crc32.New(utils.CastagnoliCrcTable)
+		data := buffer.Bytes()[startPos:]
+		hash.Write(data)
+		checksum := hash.Sum32()
+
+		// 将校验和写入buffer
+		checksumBytes := utils.U32ToBytes(checksum)
+		buffer.Write(checksumBytes)
+	}
+
+	// 返回写入的总长度
+	totalLen := buffer.Len() - startPos
+	return uint32(totalLen), nil
 }
 
 // DecodeEntry 解码条目

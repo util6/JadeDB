@@ -312,14 +312,26 @@ func (h Header) Encode(out []byte) int {
 // buf: 输入的字节数组，包含Header的所有信息。
 // 返回值: 解码后消耗的字节数。
 func (h *Header) Decode(buf []byte) int {
+	if len(buf) == 0 {
+		return 0
+	}
 	h.Meta = buf[0]
 	index := 1
+	if index >= len(buf) {
+		return index
+	}
 	klen, count := binary.Uvarint(buf[index:])
 	h.KLen = uint32(klen)
 	index += count
+	if index >= len(buf) {
+		return index
+	}
 	vlen, count := binary.Uvarint(buf[index:])
 	h.VLen = uint32(vlen)
 	index += count
+	if index >= len(buf) {
+		return index
+	}
 	h.ExpiresAt, count = binary.Uvarint(buf[index:])
 	return index + count
 }

@@ -166,7 +166,7 @@ func (s *Stats) StartStats() {
 // - 统计收集器应该是轻量级的，不影响数据库性能
 // - 初始值应该合理，反映数据库的初始状态
 // - 支持根据配置选项调整统计行为
-func newStats(opt *Options) *Stats {
+func NewStats(opt *Options) *Stats {
 	// 创建统计信息结构体实例
 	s := &Stats{}
 
