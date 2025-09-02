@@ -49,6 +49,9 @@ type PercolatorMVCC struct {
 	// 锁管理器
 	lockManager *locks.DistributedLockManager
 
+	// Lock列族缓存
+	lockCache *LockCache
+
 	// 配置
 	config *PercolatorMVCCConfig
 
@@ -71,6 +74,10 @@ type PercolatorMVCCConfig struct {
 	BatchSize         int  // 批处理大小
 	CacheSize         int  // 缓存大小
 	EnableCompression bool // 是否启用压缩
+
+	// 缓存配置
+	EnableLockCache bool             // 是否启用Lock缓存
+	LockCacheConfig *LockCacheConfig // Lock缓存配置
 
 	// 冲突检测配置
 	ConflictWindow time.Duration // 冲突检测窗口
@@ -99,6 +106,9 @@ type PercolatorMVCCMetrics struct {
 	LockEntries  uint64
 	WriteEntries uint64
 	DataEntries  uint64
+
+	// 缓存统计
+	LockCacheStats *LockCacheStats
 }
 
 // PercolatorTxnInfo Percolator事务信息
@@ -137,13 +147,24 @@ func NewPercolatorMVCC(storageEngine storage.Engine, lockManager *locks.Distribu
 		config = DefaultPercolatorMVCCConfig()
 	}
 
-	return &PercolatorMVCC{
+	pmvcc := &PercolatorMVCC{
 		storage:     storageEngine,
 		lockManager: lockManager,
 		config:      config,
 		metrics:     &PercolatorMVCCMetrics{},
 		activeTxns:  make(map[string]*PercolatorTxnInfo),
 	}
+
+	// 初始化Lock缓存
+	if config.EnableLockCache {
+		lockCacheConfig := config.LockCacheConfig
+		if lockCacheConfig == nil {
+			lockCacheConfig = DefaultLockCacheConfig()
+		}
+		pmvcc.lockCache = NewLockCache(storageEngine, lockCacheConfig)
+	}
+
+	return pmvcc
 }
 
 // DefaultPercolatorMVCCConfig 默认Percolator MVCC配置
@@ -155,6 +176,8 @@ func DefaultPercolatorMVCCConfig() *PercolatorMVCCConfig {
 		BatchSize:         100,
 		CacheSize:         10000,
 		EnableCompression: true,
+		EnableLockCache:   true,
+		LockCacheConfig:   DefaultLockCacheConfig(),
 		ConflictWindow:    1 * time.Second,
 		MaxRetries:        3,
 	}
@@ -442,6 +465,12 @@ func (pmvcc *PercolatorMVCC) writeLockRecord(ctx context.Context, key []byte, tx
 		CreatedAt:  time.Now(),
 	}
 
+	// 如果启用了缓存，使用缓存写入
+	if pmvcc.lockCache != nil {
+		return pmvcc.lockCache.Put(ctx, key, lockRecord)
+	}
+
+	// 否则直接写入存储引擎
 	data, err := json.Marshal(lockRecord)
 	if err != nil {
 		return err
@@ -452,6 +481,12 @@ func (pmvcc *PercolatorMVCC) writeLockRecord(ctx context.Context, key []byte, tx
 }
 
 func (pmvcc *PercolatorMVCC) getLockRecord(ctx context.Context, key []byte) (*PercolatorLockRecord, error) {
+	// 如果启用了缓存，优先从缓存读取
+	if pmvcc.lockCache != nil {
+		return pmvcc.lockCache.Get(ctx, key)
+	}
+
+	// 否则直接从存储引擎读取
 	lockKey := pmvcc.makeLockKey(key)
 	data, err := pmvcc.storage.Get(lockKey)
 	if err != nil || data == nil {
@@ -474,6 +509,12 @@ func (pmvcc *PercolatorMVCC) getLockRecord(ctx context.Context, key []byte) (*Pe
 }
 
 func (pmvcc *PercolatorMVCC) deleteLockRecord(ctx context.Context, key []byte) error {
+	// 如果启用了缓存，使用缓存删除
+	if pmvcc.lockCache != nil {
+		return pmvcc.lockCache.Delete(ctx, key)
+	}
+
+	// 否则直接从存储引擎删除
 	lockKey := pmvcc.makeLockKey(key)
 	return pmvcc.storage.Delete(lockKey)
 }
@@ -591,6 +632,12 @@ func (pmvcc *PercolatorMVCC) GetMetrics() *PercolatorMVCCMetrics {
 
 	// 返回指标的副本
 	metrics := *pmvcc.metrics
+
+	// 添加缓存统计
+	if pmvcc.lockCache != nil {
+		metrics.LockCacheStats = pmvcc.lockCache.GetStats()
+	}
+
 	return &metrics
 }
 
@@ -653,4 +700,43 @@ func (pmvcc *PercolatorMVCC) cleanupExpiredLocks(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// GetLockCache 获取Lock缓存实例
+func (pmvcc *PercolatorMVCC) GetLockCache() *LockCache {
+	return pmvcc.lockCache
+}
+
+// EnableLockCache 启用Lock缓存
+func (pmvcc *PercolatorMVCC) EnableLockCache(config *LockCacheConfig) {
+	pmvcc.mu.Lock()
+	defer pmvcc.mu.Unlock()
+
+	if pmvcc.lockCache == nil {
+		if config == nil {
+			config = DefaultLockCacheConfig()
+		}
+		pmvcc.lockCache = NewLockCache(pmvcc.storage, config)
+		pmvcc.config.EnableLockCache = true
+	}
+}
+
+// DisableLockCache 禁用Lock缓存
+func (pmvcc *PercolatorMVCC) DisableLockCache() {
+	pmvcc.mu.Lock()
+	defer pmvcc.mu.Unlock()
+
+	if pmvcc.lockCache != nil {
+		pmvcc.lockCache.Clear()
+		pmvcc.lockCache = nil
+		pmvcc.config.EnableLockCache = false
+	}
+}
+
+// WarmupLockCache 预热Lock缓存
+func (pmvcc *PercolatorMVCC) WarmupLockCache(ctx context.Context, keys [][]byte) error {
+	if pmvcc.lockCache == nil {
+		return fmt.Errorf("lock cache not enabled")
+	}
+	return pmvcc.lockCache.Warmup(ctx, keys)
 }
