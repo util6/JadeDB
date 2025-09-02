@@ -1,0 +1,201 @@
+{
+  "main": {
+    "id": "a4257bcb7eed09cf",
+    "type": "split",
+    "children": [
+      {
+        "id": "7cc3bfbe01560380",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "98889a8ca57e777c",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "历史记录/TODO项分析与优化计划.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "TODO项分析与优化计划"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "b51385694f3f7b3b",
+    "type": "split",
+    "children": [
+      {
+        "id": "7081b606a3ad8373",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "b9a011718e1e4d7f",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "文件列表"
+            }
+          },
+          {
+            "id": "796567b90b5be7ca",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "搜索"
+            }
+          },
+          {
+            "id": "049318f0e2802691",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "书签"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "2c12a1426d6d698b",
+    "type": "split",
+    "children": [
+      {
+        "id": "e3650697a9a7c914",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "69a1e217067eb628",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "存储引擎接口设计文档.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "存储引擎接口设计文档 的反向链接列表"
+            }
+          },
+          {
+            "id": "1debd7ee00992032",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "存储引擎接口设计文档.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "存储引擎接口设计文档 的出链列表"
+            }
+          },
+          {
+            "id": "b83b0e54d306a839",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "标签"
+            }
+          },
+          {
+            "id": "19dcfb6486348f9d",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "存储引擎接口设计文档.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "存储引擎接口设计文档 的大纲"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:打开快速切换": false,
+      "graph:查看关系图谱": false,
+      "canvas:新建白板": false,
+      "daily-notes:打开/创建今天的日记": false,
+      "templates:插入模板": false,
+      "command-palette:打开命令面板": false,
+      "bases:创建新数据库": false
+    }
+  },
+  "active": "98889a8ca57e777c",
+  "lastOpenFiles": [
+    "TODO项优化完成总结.md",
+    "技术方案/PebbleDB-优化完成总结.md",
+    "技术方案/PebbleDB-优化使用指南.md",
+    "技术方案/PebbleDB-优化方案.md",
+    "技术方案/Coalescer与Compact对比分析.md",
+    "历史记录/架构重构总结-Phase4.3.md",
+    "历史记录/项目最新进度总结-Phase6.2.md",
+    "历史记录/项目开发文档-JadeDB.md",
+    "历史记录/项目关键文件与函数功能说明.md",
+    "历史记录/项目当前状态概览.md",
+    "历史记录/TODO项优化完成总结.md",
+    "技术方案/LOCK_CACHE_IMPLEMENTATION.md",
+    "使用指南/文件重组实施指南.md",
+    "使用指南/优化功能使用指南.md",
+    "架构设计/性能监控系统文档.md",
+    "架构设计/三层架构协调设计.md",
+    "架构设计/存储引擎接口设计文档.md",
+    "架构设计/SQL解析和查询引擎设计.md",
+    "架构设计/Phase6-TiDB架构实现计划.md",
+    "架构设计/分布式事务管理设计.md",
+    "架构设计/分布式事务层与共识层边界分析.md",
+    "架构设计/分布式SQL系统架构设计.md",
+    "技术方案/LSM引擎优化完成总结.md",
+    "架构设计/JadeDB循环依赖重构报告.md",
+    "架构设计/JadeDB文件组织优化建议.md",
+    "架构设计/JadeDB-vs-CockroachDB存储引擎差距分析报告.md"
+  ]
+}
