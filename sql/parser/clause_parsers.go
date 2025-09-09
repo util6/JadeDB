@@ -86,131 +86,104 @@ func (p *ParserImpl) isNextClauseKeyword(tokenType lexer.TokenType) bool {
 }
 
 // parseFromClause parses the FROM clause.
-// Assumes the `FROM` token has already been consumed.
+// Assumes `FROM` keyword has been consumed.
 func (p *ParserImpl) parseFromClause() (*ast.FromClause, error) {
-	// Parse the first table reference
+	pos := p.getCurrentPosition()
+	clause := &ast.FromClause{
+		Position: pos,
+		Tables:   make([]ast.TableReference, 0),
+	}
+	p.incrementNodeCount()
+
+	// Parse first table reference
 	tableRef, err := p.parseTableReference()
 	if err != nil {
 		return nil, err
 	}
+	clause.Tables = append(clause.Tables, *tableRef)
 
-	clause := &ast.FromClause{
-		Position: p.getCurrentPosition(),
-		Tables:   []ast.TableReference{*tableRef},
-	}
-
-	// Parse JOINs or additional table references
-	for {
-		if p.matchTokens(lexer.JOIN, lexer.INNER, lexer.LEFT, lexer.RIGHT, lexer.FULL, lexer.CROSS) {
-			// Parse JOIN clause
-			joinClause, err := p.parseJoinClause()
-			if err != nil {
-				return nil, err
-			}
-			// Add the joined table to the last table reference
-			lastIdx := len(clause.Tables) - 1
-			clause.Tables[lastIdx].Joins = append(clause.Tables[lastIdx].Joins, joinClause)
-		} else if p.matchToken(lexer.COMMA) {
-			// Parse additional table reference (comma-separated)
-			p.nextToken() // consume comma
-			tableRef, err := p.parseTableReference()
-			if err != nil {
-				return nil, err
-			}
-			clause.Tables = append(clause.Tables, *tableRef)
-		} else {
-			break
+	// Parse additional table references separated by commas
+	for p.matchToken(lexer.COMMA) {
+		p.nextToken() // consume comma
+		tableRef, err := p.parseTableReference()
+		if err != nil {
+			return nil, err
 		}
+		clause.Tables = append(clause.Tables, *tableRef)
 	}
 
 	return clause, nil
 }
 
-// parseTableReference parses a table reference with optional alias
+// parseTableReference parses a table reference which can be:
+// 1. A simple table name
+// 2. A subquery with an alias
 func (p *ParserImpl) parseTableReference() (*ast.TableReference, error) {
 	pos := p.getCurrentPosition()
-
-	// Check for subquery (parenthesized SELECT)
-	if p.matchToken(lexer.LEFT_PAREN) {
-		// This would be a subquery - for now, return an error
-		return nil, fmt.Errorf("subqueries in FROM clause not yet supported")
-	}
-
-	// Parse table name (possibly qualified: schema.table or db.schema.table)
-	if !p.matchToken(lexer.IDENTIFIER) {
-		return nil, fmt.Errorf("expected table name in FROM clause")
-	}
-
-	firstPart := p.currentToken.Value
-	p.nextToken()
-
-	var schemaName, tableName string
-
-	// Check for qualified table name
-	if p.matchToken(lexer.DOT) {
-		p.nextToken() // consume dot
-		if !p.matchToken(lexer.IDENTIFIER) {
-			return nil, fmt.Errorf("expected table name after schema")
-		}
-
-		secondPart := p.currentToken.Value
-		p.nextToken()
-
-		// Check for three-part name (db.schema.table)
-		if p.matchToken(lexer.DOT) {
-			p.nextToken() // consume second dot
-			if !p.matchToken(lexer.IDENTIFIER) {
-				return nil, fmt.Errorf("expected table name after schema")
-			}
-
-			// Three parts: db.schema.table (we'll use schema.table for now)
-			schemaName = secondPart
-			tableName = p.currentToken.Value
-			p.nextToken()
-		} else {
-			// Two parts: schema.table
-			schemaName = firstPart
-			tableName = secondPart
-		}
-	} else {
-		// Single part: table
-		tableName = firstPart
-	}
-
-	// Create table expression
-	tableExpr := &ast.ColumnReference{
-		Position: pos,
-		Schema:   schemaName,
-		Table:    "",
-		Column:   tableName, // In FROM context, Column represents the table name
-	}
-
 	tableRef := &ast.TableReference{
 		Position: pos,
-		Table:    tableExpr,
-		Alias:    "",
+		Joins:    make([]*ast.JoinClause, 0),
 	}
+	p.incrementNodeCount()
 
-	// Check for table alias
-	if p.matchToken(lexer.AS) {
-		p.nextToken() // consume AS
+	// Check if it's a subquery (parenthesized SELECT statement)
+	if p.matchToken(lexer.LEFT_PAREN) {
+		nextToken := p.peekTokenN(1)
+		if nextToken.Type == lexer.SELECT {
+			// It's a subquery
+			subquery := p.parseSubqueryExpression()
+			if subquery == nil {
+				return nil, fmt.Errorf("failed to parse subquery in FROM clause")
+			}
+			tableRef.Table = subquery
+
+			// Expect an alias for subquery
+			if !p.matchToken(lexer.IDENTIFIER) {
+				p.addError("子查询必须有别名", []lexer.TokenType{lexer.IDENTIFIER}, p.currentToken.Type)
+				return tableRef, nil
+			}
+
+			tableRef.Alias = p.currentToken.Value
+			p.nextToken() // consume alias
+		} else {
+			// Regular parenthesized expression, fallback to expression parsing
+			expr := p.parseParenthesizedExpression()
+			if expr == nil {
+				return nil, fmt.Errorf("failed to parse parenthesized expression in FROM clause")
+			}
+			// This is not a valid table reference
+			return nil, fmt.Errorf("invalid table reference")
+		}
+	} else if p.matchToken(lexer.IDENTIFIER) {
+		// Simple table name
+		tableName := p.currentToken.Value
+		p.nextToken()
+
+		// Create a column reference to represent the table name
+		tableExpr := &ast.ColumnReference{
+			Position: pos,
+			Column:   tableName,
+		}
+		p.incrementNodeCount()
+
+		tableRef.Table = tableExpr
+
+		// Check for optional alias
 		if p.matchToken(lexer.IDENTIFIER) {
 			tableRef.Alias = p.currentToken.Value
 			p.nextToken()
-		} else if p.canBeUsedAsIdentifier(p.currentToken.Type) {
-			tableRef.Alias = p.currentToken.Value
-			p.nextToken()
-		} else {
-			return nil, fmt.Errorf("expected alias name after AS")
 		}
-	} else if p.matchToken(lexer.IDENTIFIER) && !p.isNextClauseKeyword(p.currentToken.Type) {
-		// Alias without AS keyword
-		tableRef.Alias = p.currentToken.Value
-		p.nextToken()
-	} else if p.canBeUsedAsIdentifier(p.currentToken.Type) && !p.isNextClauseKeyword(p.currentToken.Type) {
-		// Keyword as alias (without AS)
-		tableRef.Alias = p.currentToken.Value
-		p.nextToken()
+	} else {
+		return nil, fmt.Errorf("expected table name or subquery in FROM clause")
+	}
+
+	// Parse JOIN clauses if present
+	for p.matchTokens(lexer.INNER, lexer.LEFT, lexer.RIGHT, lexer.FULL, lexer.CROSS, lexer.JOIN) {
+		joinClause, err := p.parseJoinClause()
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse JOIN clause: %v", err)
+		}
+		tableRef.Joins = append(tableRef.Joins, joinClause)
 	}
 
 	return tableRef, nil
@@ -229,7 +202,12 @@ func (p *ParserImpl) parseWhereClause() (ast.Expression, error) {
 // parseGroupByClause parses the GROUP BY clause.
 // Assumes `GROUP BY` has been consumed.
 func (p *ParserImpl) parseGroupByClause() (*ast.GroupByClause, error) {
-	clause := &ast.GroupByClause{}
+	pos := p.getCurrentPosition()
+	clause := &ast.GroupByClause{
+		Position: pos,
+		Columns:  make([]ast.Expression, 0),
+	}
+	p.incrementNodeCount()
 
 	// Parse first expression
 	expr := p.ParseExpression()
@@ -254,8 +232,12 @@ func (p *ParserImpl) parseGroupByClause() (*ast.GroupByClause, error) {
 // parseOrderByClause parses the ORDER BY clause.
 // Assumes `ORDER BY` has been consumed.
 func (p *ParserImpl) parseOrderByClause() (*ast.OrderByClause, error) {
-	clause := &ast.OrderByClause{}
-	var items []ast.OrderByItem
+	pos := p.getCurrentPosition()
+	clause := &ast.OrderByClause{
+		Position: pos,
+		Items:    make([]ast.OrderByItem, 0),
+	}
+	p.incrementNodeCount()
 
 	for {
 		expr := p.ParseExpression()
@@ -263,7 +245,7 @@ func (p *ParserImpl) parseOrderByClause() (*ast.OrderByClause, error) {
 			return nil, fmt.Errorf("expected expression in ORDER BY clause")
 		}
 
-		item := &ast.OrderByItem{Expression: expr}
+		item := ast.OrderByItem{Expression: expr}
 
 		// Check for ASC/DESC
 		if p.matchToken(lexer.ASC) {
@@ -276,22 +258,26 @@ func (p *ParserImpl) parseOrderByClause() (*ast.OrderByClause, error) {
 			item.Ascending = true // default
 		}
 
-		items = append(items, *item)
+		clause.Items = append(clause.Items, item)
 
+		// Continue if there's a comma
 		if !p.matchToken(lexer.COMMA) {
 			break
 		}
 		p.nextToken() // consume comma
 	}
 
-	clause.Items = items
 	return clause, nil
 }
 
 // parseLimitClause parses the LIMIT clause.
 // Assumes `LIMIT` has been consumed.
 func (p *ParserImpl) parseLimitClause() (*ast.LimitClause, error) {
-	clause := &ast.LimitClause{}
+	pos := p.getCurrentPosition()
+	clause := &ast.LimitClause{
+		Position: pos,
+	}
+	p.incrementNodeCount()
 
 	// Parse count
 	countExpr := p.ParseExpression()
@@ -301,8 +287,18 @@ func (p *ParserImpl) parseLimitClause() (*ast.LimitClause, error) {
 	clause.Count = countExpr
 
 	// Parse offset if present
-	if p.matchToken(lexer.COMMA) || p.matchToken(lexer.OFFSET) {
-		p.nextToken() // consume comma or OFFSET
+	if p.matchToken(lexer.COMMA) {
+		// Format: LIMIT offset, count
+		clause.Offset = clause.Count // What we thought was count is actually offset
+		p.nextToken()                // consume comma
+		offsetExpr := p.ParseExpression()
+		if offsetExpr == nil {
+			return nil, fmt.Errorf("expected expression for LIMIT count")
+		}
+		clause.Count = offsetExpr
+	} else if p.matchToken(lexer.OFFSET) {
+		// Format: LIMIT count OFFSET offset
+		p.nextToken() // consume OFFSET
 		offsetExpr := p.ParseExpression()
 		if offsetExpr == nil {
 			return nil, fmt.Errorf("expected expression for LIMIT offset")

@@ -2,6 +2,7 @@ package parser
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/util6/JadeDB/sql/ast"
 	"github.com/util6/JadeDB/sql/lexer"
@@ -280,7 +281,7 @@ func (p *ParserImpl) parseCreateStatement() ast.Statement {
 	// 检查CREATE的类型
 	if p.matchToken(lexer.TABLE) {
 		return p.parseCreateTableStatement(startPos)
-	} else if p.matchToken(lexer.INDEX) {
+	} else if p.matchToken(lexer.INDEX) || p.matchToken(lexer.UNIQUE) {
 		return p.parseCreateIndexStatement(startPos)
 	} else {
 		p.addError("期望TABLE或INDEX", []lexer.TokenType{lexer.TABLE, lexer.INDEX}, p.currentToken.Type)
@@ -476,40 +477,64 @@ func (p *ParserImpl) parseColumnList() ([]string, error) {
 }
 
 // parseTableDefinition 解析表定义
-// 解析CREATE TABLE语句中的列定义和约束
+// This function now parses column definitions with constraints like NOT NULL and DEFAULT.
 func (p *ParserImpl) parseTableDefinition() ([]ast.ColumnDefinition, []ast.Constraint, error) {
 	var columns []ast.ColumnDefinition
 	var constraints []ast.Constraint
 
 	for !p.matchToken(lexer.RIGHT_PAREN) && !p.isAtEnd() {
-		// 简化实现：只解析基本的列定义
-		if !p.matchToken(lexer.IDENTIFIER) {
-			return nil, nil, fmt.Errorf("expected column name or constraint")
-		}
-
-		colName := p.currentToken.Value
-		p.nextToken()
-
-		// 期望数据类型
-		if !p.matchToken(lexer.IDENTIFIER) {
-			return nil, nil, fmt.Errorf("expected data type for column %s", colName)
-		}
-
-		dataType := p.currentToken.Value
-		p.nextToken()
-
-		// 创建列定义
-		column := ast.ColumnDefinition{
-			Name: colName,
-			DataType: ast.DataType{
-				Name: dataType,
-			},
-		}
-		columns = append(columns, column)
-
-		// 跳过可选的列约束（简化实现）
-		for p.matchTokens(lexer.NOT, lexer.NULL_LIT, lexer.PRIMARY, lexer.KEY, lexer.UNIQUE, lexer.DEFAULT) {
+		// Check for table-level constraints
+		if p.matchTokens(lexer.CONSTRAINT, lexer.PRIMARY, lexer.UNIQUE, lexer.FOREIGN, lexer.CHECK) {
+			constraint, err := p.parseTableConstraint()
+			if err != nil {
+				p.addErrorf("failed to parse table constraint: %v", err)
+			} else if constraint != nil {
+				constraints = append(constraints, *constraint)
+			}
+		} else if p.matchToken(lexer.IDENTIFIER) {
+			// Parse column definition
+			colName := p.currentToken.Value
 			p.nextToken()
+
+			// 期望数据类型
+			if !p.matchToken(lexer.IDENTIFIER) {
+				return nil, nil, fmt.Errorf("expected data type for column %s", colName)
+			}
+
+			dataType := p.currentToken.Value
+			p.nextToken()
+
+			// 创建列定义
+			column := ast.ColumnDefinition{
+				Name: colName,
+				DataType: ast.DataType{
+					Name: dataType,
+				},
+			}
+
+			// 解析列约束
+			for {
+				if p.matchToken(lexer.NOT) {
+					p.nextToken() // consume NOT
+					if p.expectToken(lexer.NULL_LIT) {
+						column.NotNull = true
+					}
+				} else if p.matchToken(lexer.DEFAULT) {
+					p.nextToken() // consume DEFAULT
+					defaultValue := p.ParseExpression()
+					if defaultValue != nil {
+						column.DefaultValue = defaultValue
+					} else {
+						p.addError("DEFAULT后缺少表达式", nil, p.currentToken.Type)
+					}
+				} else {
+					break
+				}
+			}
+
+			columns = append(columns, column)
+		} else {
+			return nil, nil, fmt.Errorf("expected column name or constraint")
 		}
 
 		// 如果有逗号，继续解析下一列
@@ -523,30 +548,287 @@ func (p *ParserImpl) parseTableDefinition() ([]ast.ColumnDefinition, []ast.Const
 	return columns, constraints, nil
 }
 
-// parseCreateIndexStatement 解析CREATE INDEX语句（基础实现）
-// 参数:
-//
-//	startPos: 语句开始位置
-//
-// 返回:
-//
-//	ast.Statement: CREATE INDEX语句AST节点
-func (p *ParserImpl) parseCreateIndexStatement(startPos lexer.Position) ast.Statement {
-	// 暂时返回nil，表示未实现
-	p.addError("CREATE INDEX语句暂未实现", nil, p.currentToken.Type)
-	return nil
+func (p *ParserImpl) parseTableConstraint() (*ast.Constraint, error) {
+	constraint := &ast.Constraint{}
+
+	if p.matchToken(lexer.CONSTRAINT) {
+		p.nextToken() // consume CONSTRAINT
+		if p.matchToken(lexer.IDENTIFIER) {
+			constraint.Name = p.currentToken.Value
+			p.nextToken()
+		} else {
+			return nil, fmt.Errorf("expected constraint name after CONSTRAINT")
+		}
+	}
+
+	if p.matchToken(lexer.PRIMARY) {
+		p.nextToken() // consume PRIMARY
+		if p.expectToken(lexer.KEY) {
+			constraint.Type = ast.PrimaryKey
+			columns, err := p.parseColumnList()
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse column list for PRIMARY KEY: %v", err)
+			}
+			constraint.Columns = columns
+		} else {
+			return nil, fmt.Errorf("expected KEY after PRIMARY")
+		}
+	} else if p.matchToken(lexer.UNIQUE) {
+		p.nextToken() // consume UNIQUE
+		constraint.Type = ast.Unique
+		columns, err := p.parseColumnList()
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse column list for UNIQUE constraint: %v", err)
+		}
+		constraint.Columns = columns
+	} else {
+		// Add other constraints like FOREIGN KEY, CHECK here
+		return nil, fmt.Errorf("unsupported constraint type")
+	}
+
+	return constraint, nil
 }
 
-// parseDropIndexStatement 解析DROP INDEX语句（基础实现）
-// 参数:
-//
-//	startPos: 语句开始位置
-//
-// 返回:
-//
-//	ast.Statement: DROP INDEX语句AST节点
+// parseCreateIndexStatement 解析CREATE INDEX语句
+func (p *ParserImpl) parseCreateIndexStatement(startPos lexer.Position) ast.Statement {
+	unique := false
+	if p.matchToken(lexer.UNIQUE) {
+		p.nextToken() // consume UNIQUE
+		unique = true
+	}
+
+	if !p.expectToken(lexer.INDEX) {
+		return nil
+	}
+
+	if !p.matchToken(lexer.IDENTIFIER) {
+		p.addError("expected index name", []lexer.TokenType{lexer.IDENTIFIER}, p.currentToken.Type)
+		return nil
+	}
+	indexName := p.currentToken.Value
+	p.nextToken()
+
+	if !p.expectToken(lexer.ON) {
+		return nil
+	}
+
+	if !p.matchToken(lexer.IDENTIFIER) {
+		p.addError("expected table name", []lexer.TokenType{lexer.IDENTIFIER}, p.currentToken.Type)
+		return nil
+	}
+	tableName := p.currentToken.Value
+	p.nextToken()
+
+	columns, err := p.parseColumnList()
+	if err != nil {
+		p.addErrorf("failed to parse column list for index: %v", err)
+		return nil
+	}
+
+	return &ast.CreateIndexStatement{
+		Position:  startPos,
+		IndexName: indexName,
+		TableName: tableName,
+		Columns:   columns,
+		Unique:    unique,
+	}
+}
+
+// parseDropIndexStatement 解析DROP INDEX语句
 func (p *ParserImpl) parseDropIndexStatement(startPos lexer.Position) ast.Statement {
-	// 暂时返回nil，表示未实现
-	p.addError("DROP INDEX语句暂未实现", nil, p.currentToken.Type)
-	return nil
+	if !p.expectToken(lexer.INDEX) {
+		return nil
+	}
+
+	if !p.matchToken(lexer.IDENTIFIER) {
+		p.addError("expected index name", []lexer.TokenType{lexer.IDENTIFIER}, p.currentToken.Type)
+		return nil
+	}
+	indexName := p.currentToken.Value
+	p.nextToken()
+
+	return &ast.DropIndexStatement{
+		Position:  startPos,
+		IndexName: indexName,
+	}
+}
+
+// parseBeginTransactionStatement 解析BEGIN TRANSACTION语句
+// 支持以下格式：
+// - BEGIN
+// - BEGIN TRANSACTION
+// - BEGIN WORK
+func (p *ParserImpl) parseBeginTransactionStatement() ast.Statement {
+	startPos := p.getCurrentPosition()
+
+	// 期望BEGIN关键字
+	if !p.expectToken(lexer.BEGIN) {
+		return nil
+	}
+
+	// 创建BEGIN TRANSACTION语句节点
+	beginStmt := &ast.BeginTransactionStatement{
+		Position: startPos,
+	}
+	p.incrementNodeCount()
+
+	// 可选的TRANSACTION或WORK关键字
+	if p.matchToken(lexer.IDENTIFIER) {
+		tokenValue := strings.ToUpper(p.currentToken.Value)
+		if tokenValue == "TRANSACTION" || tokenValue == "WORK" {
+			p.nextToken() // 跳过TRANSACTION/WORK关键字
+		}
+	}
+
+	return beginStmt
+}
+
+// parseCommitTransactionStatement 解析COMMIT TRANSACTION语句
+// 支持以下格式：
+// - COMMIT
+// - COMMIT TRANSACTION
+// - COMMIT WORK
+func (p *ParserImpl) parseCommitTransactionStatement() ast.Statement {
+	startPos := p.getCurrentPosition()
+
+	// 期望COMMIT关键字
+	if !p.expectToken(lexer.COMMIT) {
+		return nil
+	}
+
+	// 创建COMMIT TRANSACTION语句节点
+	commitStmt := &ast.CommitTransactionStatement{
+		Position: startPos,
+	}
+	p.incrementNodeCount()
+
+	// 可选的TRANSACTION或WORK关键字
+	if p.matchToken(lexer.IDENTIFIER) {
+		tokenValue := strings.ToUpper(p.currentToken.Value)
+		if tokenValue == "TRANSACTION" || tokenValue == "WORK" {
+			p.nextToken() // 跳过TRANSACTION/WORK关键字
+		}
+	}
+
+	return commitStmt
+}
+
+// parseRollbackTransactionStatement 解析ROLLBACK TRANSACTION语句
+// 支持以下格式：
+// - ROLLBACK
+// - ROLLBACK TRANSACTION
+// - ROLLBACK WORK
+func (p *ParserImpl) parseRollbackTransactionStatement() ast.Statement {
+	startPos := p.getCurrentPosition()
+
+	// 期望ROLLBACK关键字
+	if !p.expectToken(lexer.ROLLBACK) {
+		return nil
+	}
+
+	// 创建ROLLBACK TRANSACTION语句节点
+	rollbackStmt := &ast.RollbackTransactionStatement{
+		Position: startPos,
+	}
+	p.incrementNodeCount()
+
+	// 可选的TRANSACTION或WORK关键字
+	if p.matchToken(lexer.IDENTIFIER) {
+		tokenValue := strings.ToUpper(p.currentToken.Value)
+		if tokenValue == "TRANSACTION" || tokenValue == "WORK" {
+			p.nextToken() // 跳过TRANSACTION/WORK关键字
+		}
+	}
+
+	return rollbackStmt
+}
+
+// parseUnionStatement 解析集合操作语句 (UNION, INTERSECT, EXCEPT)
+// 这个方法处理两个SELECT语句之间的集合操作
+func (p *ParserImpl) parseUnionStatement(leftSelect *ast.SelectStatement) ast.Statement {
+	startPos := p.getCurrentPosition()
+
+	// 确定集合操作类型
+	var unionType ast.UnionType
+	var all bool = false
+
+	switch p.currentToken.Type {
+	case lexer.UNION:
+		unionType = ast.UNION_TYPE
+		p.nextToken() // 跳过UNION
+
+		// 检查是否为UNION ALL
+		if p.matchToken(lexer.ALL) {
+			all = true
+			p.nextToken() // 跳过ALL
+		}
+
+	case lexer.INTERSECT:
+		unionType = ast.INTERSECT_TYPE
+		p.nextToken() // 跳过INTERSECT
+
+		// 检查是否为INTERSECT ALL
+		if p.matchToken(lexer.ALL) {
+			all = true
+			p.nextToken() // 跳过ALL
+		}
+
+	case lexer.EXCEPT:
+		unionType = ast.EXCEPT_TYPE
+		p.nextToken() // 跳过EXCEPT
+
+		// 检查是否为EXCEPT ALL
+		if p.matchToken(lexer.ALL) {
+			all = true
+			p.nextToken() // 跳过ALL
+		}
+
+	default:
+		p.addErrorf("期望集合操作关键字 (UNION, INTERSECT, EXCEPT)，但遇到 %s",
+			lexer.TokenName(p.currentToken.Type))
+		return nil
+	}
+
+	// 解析右侧的SELECT语句
+	if !p.matchToken(lexer.SELECT) {
+		p.addError("集合操作后期望SELECT语句", []lexer.TokenType{lexer.SELECT}, p.currentToken.Type)
+		return nil
+	}
+
+	rightSelect := p.parseSelectStatement()
+	if rightSelect == nil {
+		return nil
+	}
+
+	// 创建UNION语句节点
+	unionStmt := &ast.UnionStatement{
+		Position:  startPos,
+		Left:      leftSelect,
+		Right:     rightSelect.(*ast.SelectStatement),
+		UnionType: unionType,
+		All:       all,
+	}
+	p.incrementNodeCount()
+
+	// 注意：暂时不支持复杂的链式集合操作
+	// 如果需要链式操作，可以使用括号来明确优先级
+
+	return unionStmt
+}
+
+// parseSelectStatementWithUnion 解析可能包含集合操作的SELECT语句
+// 这是对原有parseSelectStatement的扩展，支持集合操作
+func (p *ParserImpl) parseSelectStatementWithUnion() ast.Statement {
+	// 首先解析基本的SELECT语句
+	selectStmt := p.parseSelectStatement()
+	if selectStmt == nil {
+		return nil
+	}
+
+	// 检查是否有集合操作
+	if p.matchTokens(lexer.UNION, lexer.INTERSECT, lexer.EXCEPT) {
+		return p.parseUnionStatement(selectStmt.(*ast.SelectStatement))
+	}
+
+	return selectStmt
 }

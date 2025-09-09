@@ -3,6 +3,7 @@ package parser
 import (
 	"fmt"
 
+	"github.com/util6/JadeDB/sql/ast"
 	"github.com/util6/JadeDB/sql/lexer"
 )
 
@@ -412,4 +413,131 @@ func (p *ParserImpl) decrementDepth() {
 // incrementNodeCount 增加节点计数
 func (p *ParserImpl) incrementNodeCount() {
 	p.nodeCount++
+}
+
+// canBeUsedAsIdentifier 检查Token是否可以用作标识符
+// 某些关键字在特定上下文中可以用作标识符（如别名）
+func (p *ParserImpl) canBeUsedAsIdentifier(tokenType lexer.TokenType) bool {
+	switch tokenType {
+	// 数据类型关键字可以用作别名
+	case lexer.INT, lexer.INTEGER, lexer.BIGINT, lexer.SMALLINT, lexer.TINYINT:
+		return true
+	case lexer.DECIMAL, lexer.NUMERIC, lexer.FLOAT, lexer.DOUBLE, lexer.REAL:
+		return true
+	case lexer.VARCHAR, lexer.CHAR, lexer.TEXT, lexer.BLOB:
+		return true
+	case lexer.DATE, lexer.TIME, lexer.TIMESTAMP, lexer.DATETIME:
+		return true
+	case lexer.BOOLEAN, lexer.BINARY, lexer.VARBINARY:
+		return true
+
+	// 某些SQL关键字在特定上下文中可以用作标识符
+	case lexer.KEY, lexer.INDEX, lexer.COLUMN:
+		return true
+	case lexer.ASC, lexer.DESC:
+		return true
+
+	// 函数名关键字可以用作别名
+	case lexer.COUNT, lexer.SUM, lexer.AVG, lexer.MAX, lexer.MIN:
+		return true
+
+	default:
+		return false
+	}
+}
+
+// Parse 实现Parser接口的Parse方法
+// 解析Token流并返回AST
+func (p *ParserImpl) Parse(tokens []lexer.Token) (*ast.AST, error) {
+	p.tokens = tokens
+	p.tokenCount = len(tokens)
+	p.position = 0
+	p.errors = make([]ParseError, 0)
+	p.nodeCount = 0
+
+	// 重新初始化Token状态
+	p.initializeTokens()
+
+	// 解析所有语句
+	statements := make([]ast.Statement, 0)
+
+	for !p.isAtEnd() {
+		// 跳过分号
+		if p.matchToken(lexer.SEMICOLON) {
+			p.nextToken()
+			continue
+		}
+
+		stmt := p.ParseStatement()
+		if stmt != nil {
+			statements = append(statements, stmt)
+		}
+
+		// 如果遇到错误且无法恢复，跳出循环
+		if p.HasErrors() && len(p.errors) >= p.maxErrors {
+			break
+		}
+	}
+
+	// 创建AST
+	astNode := &ast.AST{
+		Statements: statements,
+		Metadata: &ast.ASTMetadata{
+			TokenCount: p.tokenCount,
+			NodeCount:  p.nodeCount,
+		},
+	}
+
+	// 如果有错误，返回错误
+	if p.HasErrors() {
+		return astNode, &ParseErrors{Errors: p.errors}
+	}
+
+	return astNode, nil
+}
+
+// ParseStatement 实现Parser接口的ParseStatement方法
+func (p *ParserImpl) ParseStatement() ast.Statement {
+	switch p.currentToken.Type {
+	case lexer.SELECT:
+		return p.parseSelectStatementWithUnion()
+	case lexer.INSERT:
+		return p.parseInsertStatement()
+	case lexer.UPDATE:
+		return p.parseUpdateStatement()
+	case lexer.DELETE:
+		return p.parseDeleteStatement()
+	case lexer.CREATE:
+		return p.parseCreateStatement()
+	case lexer.DROP:
+		return p.parseDropStatement()
+	case lexer.BEGIN:
+		return p.parseBeginTransactionStatement()
+	case lexer.COMMIT:
+		return p.parseCommitTransactionStatement()
+	case lexer.ROLLBACK:
+		return p.parseRollbackTransactionStatement()
+	default:
+		p.addErrorf("意外的语句开始Token: %s", lexer.TokenName(p.currentToken.Type))
+		p.skipToken() // 跳过无效Token
+		return nil
+	}
+}
+
+// ParseErrors 解析错误集合
+type ParseErrors struct {
+	Errors []ParseError
+}
+
+func (e *ParseErrors) Error() string {
+	if len(e.Errors) == 0 {
+		return "解析错误"
+	}
+
+	result := "解析错误:\n"
+	for _, err := range e.Errors {
+		result += fmt.Sprintf("  第%d行，第%d列: %s\n",
+			err.Position.Line, err.Position.Column, err.Message)
+	}
+	return result
 }

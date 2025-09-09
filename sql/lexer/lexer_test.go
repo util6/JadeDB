@@ -8,11 +8,11 @@ import (
 func TestBasicTokenization(t *testing.T) {
 	input := "SELECT * FROM users WHERE id = 1"
 	lexer := NewLexer(input)
-	
+
 	expectedTokens := []TokenType{
 		SELECT, MULTIPLY, FROM, IDENTIFIER, WHERE, IDENTIFIER, EQUAL, INTEGER_LIT, EOF,
 	}
-	
+
 	for i, expected := range expectedTokens {
 		token := lexer.NextToken()
 		if token.Type != expected {
@@ -25,20 +25,20 @@ func TestBasicTokenization(t *testing.T) {
 func TestTokenizeMethod(t *testing.T) {
 	input := "SELECT name, age FROM users"
 	lexer := NewLexer(input)
-	
+
 	tokens, err := lexer.Tokenize(input)
 	if err != nil {
 		t.Errorf("Tokenize failed: %v", err)
 	}
-	
+
 	expectedTypes := []TokenType{
 		SELECT, IDENTIFIER, COMMA, IDENTIFIER, FROM, IDENTIFIER, EOF,
 	}
-	
+
 	if len(tokens) != len(expectedTypes) {
 		t.Errorf("Expected %d tokens, got %d", len(expectedTypes), len(tokens))
 	}
-	
+
 	for i, expected := range expectedTypes {
 		if i < len(tokens) && tokens[i].Type != expected {
 			t.Errorf("Token %d: expected %v, got %v", i, expected, tokens[i].Type)
@@ -57,15 +57,15 @@ func TestStringLiterals(t *testing.T) {
 		{"'hello\\nworld'", "hello\nworld"},
 		{"'it\\'s'", "it's"},
 	}
-	
+
 	for _, test := range tests {
 		lexer := NewLexer(test.input)
 		token := lexer.NextToken()
-		
+
 		if token.Type != STRING_LIT {
 			t.Errorf("Expected STRING_LIT, got %v", token.Type)
 		}
-		
+
 		if token.Value != test.expected {
 			t.Errorf("Expected value '%s', got '%s'", test.expected, token.Value)
 		}
@@ -84,11 +84,11 @@ func TestNumbers(t *testing.T) {
 		{"0x1A2B", HEX_LIT},
 		{"0b1010", BIT_LIT},
 	}
-	
+
 	for _, test := range tests {
 		lexer := NewLexer(test.input)
 		token := lexer.NextToken()
-		
+
 		if token.Type != test.expected {
 			t.Errorf("Input '%s': expected %v, got %v", test.input, test.expected, token.Type)
 		}
@@ -118,11 +118,11 @@ func TestOperators(t *testing.T) {
 		{"<<", LEFT_SHIFT},
 		{">>", RIGHT_SHIFT},
 	}
-	
+
 	for _, test := range tests {
 		lexer := NewLexer(test.input)
 		token := lexer.NextToken()
-		
+
 		if token.Type != test.expected {
 			t.Errorf("Input '%s': expected %v, got %v", test.input, test.expected, token.Type)
 		}
@@ -139,11 +139,11 @@ func TestComments(t *testing.T) {
 		{"/* 这是块注释 */", "块注释"},
 		{"/* 外层 /* 内层 */ 注释 */", "嵌套块注释"},
 	}
-	
+
 	for _, test := range tests {
 		lexer := NewLexer(test.input)
 		token := lexer.NextToken()
-		
+
 		if token.Type != COMMENT {
 			t.Errorf("%s: expected COMMENT, got %v", test.description, token.Type)
 		}
@@ -167,11 +167,11 @@ func TestKeywords(t *testing.T) {
 		{"TABLE", TABLE},
 		{"INDEX", INDEX},
 	}
-	
+
 	for _, keyword := range keywords {
 		lexer := NewLexer(keyword.input)
 		token := lexer.NextToken()
-		
+
 		if token.Type != keyword.expected {
 			t.Errorf("Keyword '%s': expected %v, got %v", keyword.input, keyword.expected, token.Type)
 		}
@@ -190,26 +190,26 @@ func TestComplexSQL(t *testing.T) {
 		ORDER BY cnt DESC
 		LIMIT 10;
 	`
-	
+
 	lexer := NewLexer(input)
 	tokens, err := lexer.Tokenize(input)
-	
+
 	if err != nil {
 		t.Errorf("Failed to tokenize complex SQL: %v", err)
 	}
-	
+
 	// 验证包含了预期的关键字
 	expectedKeywords := []TokenType{
 		SELECT, FROM, LEFT, JOIN, ON, WHERE, AND, GROUP, BY, HAVING, ORDER, BY, LIMIT,
 	}
-	
+
 	foundKeywords := make(map[TokenType]bool)
 	for _, token := range tokens {
 		if token.IsKeyword() {
 			foundKeywords[token.Type] = true
 		}
 	}
-	
+
 	for _, expected := range expectedKeywords {
 		if !foundKeywords[expected] {
 			t.Errorf("Expected keyword %v not found in tokens", expected)
@@ -228,11 +228,11 @@ func TestErrorHandling(t *testing.T) {
 		{"0x", "无效十六进制数"},
 		{"0b", "无效二进制数"},
 	}
-	
+
 	for _, test := range tests {
 		lexer := NewLexer(test.input)
 		_, err := lexer.Tokenize(test.input)
-		
+
 		if err == nil {
 			t.Errorf("%s: expected error but got none", test.description)
 		}
@@ -243,25 +243,25 @@ func TestErrorHandling(t *testing.T) {
 func TestPositionTracking(t *testing.T) {
 	input := "SELECT\n  *\nFROM users"
 	lexer := NewLexer(input)
-	
+
 	// SELECT 应该在第1行第1列
 	token1 := lexer.NextToken()
 	if token1.Position.Line != 1 || token1.Position.Column != 1 {
-		t.Errorf("SELECT position: expected (1,1), got (%d,%d)", 
+		t.Errorf("SELECT position: expected (1,1), got (%d,%d)",
 			token1.Position.Line, token1.Position.Column)
 	}
-	
+
 	// * 应该在第2行第3列
 	token2 := lexer.NextToken()
 	if token2.Position.Line != 2 || token2.Position.Column != 3 {
-		t.Errorf("* position: expected (2,3), got (%d,%d)", 
+		t.Errorf("* position: expected (2,3), got (%d,%d)",
 			token2.Position.Line, token2.Position.Column)
 	}
-	
+
 	// FROM 应该在第3行第1列
 	token3 := lexer.NextToken()
 	if token3.Position.Line != 3 || token3.Position.Column != 1 {
-		t.Errorf("FROM position: expected (3,1), got (%d,%d)", 
+		t.Errorf("FROM position: expected (3,1), got (%d,%d)",
 			token3.Position.Line, token3.Position.Column)
 	}
 }

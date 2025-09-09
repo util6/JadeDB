@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/util6/JadeDB/sql/ast"
+
 	"github.com/util6/JadeDB/sql/lexer"
 )
 

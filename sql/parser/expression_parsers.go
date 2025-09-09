@@ -550,3 +550,97 @@ func (p *ParserImpl) parseAggregateFunctionExpression() ast.Expression {
 
 	return funcCall
 }
+
+// parseSubqueryExpression 解析子查询表达式
+// 返回:
+//
+//	ast.Expression: 子查询表达式AST节点
+func (p *ParserImpl) parseSubqueryExpression() ast.Expression {
+	pos := p.getCurrentPosition()
+
+	// 期望左括号
+	if !p.expectToken(lexer.LEFT_PAREN) {
+		return nil
+	}
+
+	// 检查是否为SELECT语句
+	if !p.matchToken(lexer.SELECT) {
+		p.addError("子查询必须是SELECT语句", []lexer.TokenType{lexer.SELECT}, p.currentToken.Type)
+		return nil
+	}
+
+	// 增加递归深度检查
+	if !p.incrementDepth() {
+		return nil
+	}
+	defer p.decrementDepth()
+
+	// 解析SELECT语句
+	stmt := p.parseSelectStatement()
+	if stmt == nil {
+		return nil
+	}
+
+	// 期望右括号
+	if !p.expectToken(lexer.RIGHT_PAREN) {
+		return nil
+	}
+
+	// 创建子查询表达式节点
+	subqueryExpr := &ast.SubqueryExpression{
+		Position: pos,
+		Query:    stmt.(*ast.SelectStatement),
+	}
+	p.incrementNodeCount()
+
+	return subqueryExpr
+}
+
+// parsePrimaryExpression 解析主表达式
+// 这是表达式解析的入口点，处理各种基本表达式类型
+// 返回:
+//
+//	ast.Expression: 表达式AST节点
+func (p *ParserImpl) parsePrimaryExpression() ast.Expression {
+	switch p.currentToken.Type {
+	case lexer.INTEGER_LIT, lexer.FLOAT_LIT, lexer.STRING_LIT, lexer.HEX_LIT, lexer.BIT_LIT:
+		return p.parseLiteralExpression()
+
+	case lexer.NULL_LIT:
+		return p.parseNullLiteral()
+
+	case lexer.TRUE_LIT, lexer.FALSE_LIT:
+		return p.parseBooleanLiteral()
+
+	case lexer.IDENTIFIER:
+		// 检查是否为函数调用
+		if p.peekToken.Type == lexer.LEFT_PAREN {
+			// 检查是否为聚合函数
+			switch p.currentToken.Type {
+			case lexer.COUNT, lexer.SUM, lexer.AVG, lexer.MAX, lexer.MIN:
+				return p.parseAggregateFunctionExpression()
+			}
+			return p.parseIdentifierExpression()
+		}
+		return p.parseIdentifierExpression()
+
+	case lexer.LEFT_PAREN:
+		// 检查是否为子查询 (SELECT语句)
+		nextToken := p.peekTokenN(1)
+		if nextToken.Type == lexer.SELECT {
+			return p.parseSubqueryExpression()
+		}
+		// 否则为括号表达式
+		return p.parseParenthesizedExpression()
+
+	case lexer.CASE:
+		return p.parseCaseExpression()
+
+	case lexer.PLUS, lexer.MINUS, lexer.NOT, lexer.BIT_NOT:
+		return p.parseUnaryExpression()
+
+	default:
+		p.addErrorf("意外的Token类型: %s", lexer.TokenName(p.currentToken.Type))
+		return nil
+	}
+}

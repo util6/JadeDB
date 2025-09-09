@@ -94,6 +94,95 @@ func (d *DropTableStatement) GetPosition() lexer.Position { return d.Position }
 func (d *DropTableStatement) GetChildren() []ASTNode      { return nil }
 func (d *DropTableStatement) statementNode()              {}
 
+// CreateIndexStatement CREATE INDEX语句
+type CreateIndexStatement struct {
+	Position  lexer.Position
+	IndexName string
+	TableName string
+	Columns   []string
+	Unique    bool
+}
+
+func (c *CreateIndexStatement) String() string { return "CREATE INDEX" }
+func (c *CreateIndexStatement) Accept(visitor Visitor) interface{} {
+	return visitor.VisitCreateIndexStatement(c)
+}
+func (c *CreateIndexStatement) GetPosition() lexer.Position { return c.Position }
+func (c *CreateIndexStatement) GetChildren() []ASTNode      { return nil }
+func (c *CreateIndexStatement) statementNode()              {}
+
+// DropIndexStatement DROP INDEX语句
+type DropIndexStatement struct {
+	Position  lexer.Position
+	IndexName string
+}
+
+func (d *DropIndexStatement) String() string { return "DROP INDEX" }
+func (d *DropIndexStatement) Accept(visitor Visitor) interface{} {
+	return visitor.VisitDropIndexStatement(d)
+}
+func (d *DropIndexStatement) GetPosition() lexer.Position { return d.Position }
+func (d *DropIndexStatement) GetChildren() []ASTNode      { return nil }
+func (d *DropIndexStatement) statementNode()              {}
+
+// BeginTransactionStatement BEGIN TRANSACTION语句
+type BeginTransactionStatement struct {
+	Position lexer.Position
+}
+
+func (b *BeginTransactionStatement) String() string { return "BEGIN TRANSACTION" }
+func (b *BeginTransactionStatement) Accept(visitor Visitor) interface{} {
+	return visitor.VisitBeginTransactionStatement(b)
+}
+func (b *BeginTransactionStatement) GetPosition() lexer.Position { return b.Position }
+func (b *BeginTransactionStatement) GetChildren() []ASTNode      { return nil }
+func (b *BeginTransactionStatement) statementNode()              {}
+
+// CommitTransactionStatement COMMIT TRANSACTION语句
+type CommitTransactionStatement struct {
+	Position lexer.Position
+}
+
+func (c *CommitTransactionStatement) String() string { return "COMMIT TRANSACTION" }
+func (c *CommitTransactionStatement) Accept(visitor Visitor) interface{} {
+	return visitor.VisitCommitTransactionStatement(c)
+}
+func (c *CommitTransactionStatement) GetPosition() lexer.Position { return c.Position }
+func (c *CommitTransactionStatement) GetChildren() []ASTNode      { return nil }
+func (c *CommitTransactionStatement) statementNode()              {}
+
+// RollbackTransactionStatement ROLLBACK TRANSACTION语句
+type RollbackTransactionStatement struct {
+	Position lexer.Position
+}
+
+func (r *RollbackTransactionStatement) String() string { return "ROLLBACK TRANSACTION" }
+func (r *RollbackTransactionStatement) Accept(visitor Visitor) interface{} {
+	return visitor.VisitRollbackTransactionStatement(r)
+}
+func (r *RollbackTransactionStatement) GetPosition() lexer.Position { return r.Position }
+func (r *RollbackTransactionStatement) GetChildren() []ASTNode      { return nil }
+func (r *RollbackTransactionStatement) statementNode()              {}
+
+// UnionStatement UNION语句（集合操作）
+type UnionStatement struct {
+	Position  lexer.Position
+	Left      *SelectStatement
+	Right     *SelectStatement
+	UnionType UnionType
+	All       bool // 是否为UNION ALL
+}
+
+func (u *UnionStatement) String() string { return "UNION" }
+func (u *UnionStatement) Accept(visitor Visitor) interface{} {
+	return visitor.VisitUnionStatement(u)
+}
+func (u *UnionStatement) GetPosition() lexer.Position { return u.Position }
+func (u *UnionStatement) GetChildren() []ASTNode {
+	return []ASTNode{u.Left, u.Right}
+}
+func (u *UnionStatement) statementNode() {}
+
 // 表达式类型实现
 
 // ColumnReference 列引用
@@ -183,6 +272,20 @@ func (c *CaseExpression) Accept(visitor Visitor) interface{} { return visitor.Vi
 func (c *CaseExpression) GetPosition() lexer.Position        { return c.Position }
 func (c *CaseExpression) GetChildren() []ASTNode             { return nil }
 func (c *CaseExpression) expressionNode()                    {}
+
+// SubqueryExpression 子查询表达式
+type SubqueryExpression struct {
+	Position lexer.Position
+	Query    *SelectStatement
+}
+
+func (s *SubqueryExpression) String() string { return "SUBQUERY" }
+func (s *SubqueryExpression) Accept(visitor Visitor) interface{} {
+	return visitor.VisitSubqueryExpression(s)
+}
+func (s *SubqueryExpression) GetPosition() lexer.Position { return s.Position }
+func (s *SubqueryExpression) GetChildren() []ASTNode      { return []ASTNode{s.Query} }
+func (s *SubqueryExpression) expressionNode()             {}
 
 // 辅助结构
 
@@ -296,3 +399,33 @@ func (w *Wildcard) Accept(visitor Visitor) interface{} { return visitor.VisitWil
 func (w *Wildcard) GetPosition() lexer.Position        { return w.Position }
 func (w *Wildcard) GetChildren() []ASTNode             { return nil }
 func (w *Wildcard) expressionNode()                    {}
+
+// BetweenExpression BETWEEN表达式
+type BetweenExpression struct {
+	Position lexer.Position
+	Expr     Expression
+	Start    Expression
+	End      Expression
+}
+
+func (b *BetweenExpression) String() string { return "BETWEEN" }
+func (b *BetweenExpression) Accept(visitor Visitor) interface{} {
+	return visitor.VisitBetweenExpression(b)
+}
+func (b *BetweenExpression) GetPosition() lexer.Position { return b.Position }
+func (b *BetweenExpression) GetChildren() []ASTNode      { return nil }
+func (b *BetweenExpression) expressionNode()             {}
+
+// ValueListExpression 值列表表达式（用于IN操作符）
+type ValueListExpression struct {
+	Position lexer.Position
+	Values   []Expression
+}
+
+func (v *ValueListExpression) String() string { return "VALUE_LIST" }
+func (v *ValueListExpression) Accept(visitor Visitor) interface{} {
+	return visitor.VisitValueListExpression(v)
+}
+func (v *ValueListExpression) GetPosition() lexer.Position { return v.Position }
+func (v *ValueListExpression) GetChildren() []ASTNode      { return nil }
+func (v *ValueListExpression) expressionNode()             {}

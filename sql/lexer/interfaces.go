@@ -15,16 +15,14 @@ type Lexer interface {
 
 // Token 词法单元 - 参考TiDB设计
 type Token struct {
-	Type     TokenType     // Token类型
-	Value    string        // Token值（标准化后）
-	Raw      string        // 原始文本（保留格式）
-	Position Position      // 开始位置
-	EndPos   Position      // 结束位置
-	Line     int           // 行号（兼容性）
-	Column   int           // 列号（兼容性）
+	Type     TokenType // Token类型
+	Value    string    // Token值（标准化后）
+	Raw      string    // 原始文本（保留格式）
+	Position Position  // 开始位置
+	EndPos   Position  // 结束位置
+	Line     int       // 行号（兼容性）
+	Column   int       // 列号（兼容性）
 }
-
-
 
 // TokenType Token类型枚举 - 参考TiDB设计
 type TokenType int
@@ -33,7 +31,7 @@ const (
 	// 特殊Token
 	INVALID TokenType = iota
 	EOF
-	
+
 	// 字面量类型
 	IDENTIFIER
 	INTEGER_LIT
@@ -44,11 +42,11 @@ const (
 	NULL_LIT
 	TRUE_LIT
 	FALSE_LIT
-	
+
 	// 注释和空白
 	COMMENT
 	WHITESPACE
-	
+
 	// 操作符 - 按优先级分组
 	// 算术操作符
 	PLUS     // +
@@ -56,46 +54,46 @@ const (
 	MULTIPLY // *
 	DIVIDE   // /
 	MODULO   // %
-	
+
 	// 比较操作符
-	EQUAL         // =
-	NOT_EQUAL     // != 或 <>
-	LESS          // <
-	LESS_EQUAL    // <=
-	GREATER       // >
-	GREATER_EQUAL // >=
+	EQUAL           // =
+	NOT_EQUAL       // != 或 <>
+	LESS            // <
+	LESS_EQUAL      // <=
+	GREATER         // >
+	GREATER_EQUAL   // >=
 	NULL_SAFE_EQUAL // <=>
-	
+
 	// 逻辑操作符
 	AND_OP // &&
 	OR_OP  // ||
 	NOT_OP // !
-	
+
 	// 位操作符
-	BIT_AND    // &
-	BIT_OR     // |
-	BIT_XOR    // ^
-	BIT_NOT    // ~
-	LEFT_SHIFT // <<
+	BIT_AND     // &
+	BIT_OR      // |
+	BIT_XOR     // ^
+	BIT_NOT     // ~
+	LEFT_SHIFT  // <<
 	RIGHT_SHIFT // >>
-	
+
 	// 赋值操作符
 	ASSIGN // :=
-	
+
 	// 分隔符和标点
-	COMMA       // ,
-	SEMICOLON   // ;
-	LEFT_PAREN  // (
-	RIGHT_PAREN // )
-	LEFT_BRACE  // {
-	RIGHT_BRACE // }
-	LEFT_BRACKET // [
+	COMMA         // ,
+	SEMICOLON     // ;
+	LEFT_PAREN    // (
+	RIGHT_PAREN   // )
+	LEFT_BRACE    // {
+	RIGHT_BRACE   // }
+	LEFT_BRACKET  // [
 	RIGHT_BRACKET // ]
-	DOT         // .
-	QUESTION    // ?
-	COLON       // :
-	DOUBLE_COLON // ::
-	
+	DOT           // .
+	QUESTION      // ?
+	COLON         // :
+	DOUBLE_COLON  // ::
+
 	// SQL关键字 - 按字母顺序
 	ADD
 	ALL
@@ -103,10 +101,13 @@ const (
 	AND
 	AS
 	ASC
+	BEGIN
 	BETWEEN
 	BY
 	CASE
+	CHECK
 	COLUMN
+	COMMIT
 	CONSTRAINT
 	CREATE
 	CROSS
@@ -147,6 +148,7 @@ const (
 	PRIMARY
 	REFERENCES
 	RIGHT
+	ROLLBACK
 	SELECT
 	SET
 	TABLE
@@ -158,7 +160,9 @@ const (
 	VALUES
 	WHEN
 	WHERE
-	
+	INTERSECT
+	EXCEPT
+
 	// 数据类型关键字
 	BIGINT
 	BINARY
@@ -194,14 +198,14 @@ const (
 	VARBINARY
 	VARCHAR
 	YEAR
-	
+
 	// 函数名关键字
 	AVG
 	COUNT
 	MAX
 	MIN
 	SUM
-	
+
 	// 最大Token值，用于范围检查
 	MAX_TOKEN
 )
