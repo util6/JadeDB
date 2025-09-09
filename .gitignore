@@ -6,6 +6,8 @@
 .DS_Store
 .clinerules-*
 .kiro
+.qoder
+.spec-workflow
 
 
 work_test
